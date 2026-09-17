@@ -37,17 +37,19 @@ const ToolCard = memo(function ToolCard({ event, sessionId, onError }: { event: 
   </div>
 })
 
-const Reply = memo(function Reply({ text }: { text: string }) {
+const Reply = memo(function Reply({ text, reasoning, truncated }: { text: string; reasoning?: string; truncated?: boolean }) {
   const [copied, setCopied] = useState(false)
   return <div className="assistant-reply"><Brand small />
-    <div className="reply-content"><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
+    <div className="reply-content">{reasoning ? <details className="reasoning-summary"><summary>Provider reasoning summary</summary>
+      <p className="muted">Supplied by the model endpoint.</p><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reasoning}</ReactMarkdown></div>
+      {truncated ? <p className="muted">Summary display limit reached.</p> : null}</details> : null}<div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
       <button className="copy-button icon-button" aria-label="Copy response" onClick={() => {
         void navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) })
       }}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>
     </div></div>
 })
 
-export default function Conversation({ session, onError }: { session: Session; onError: (error: string) => void }) {
+export default function Conversation({ session, onError, onSelectSession }: { session: Session; onError: (error: string) => void; onSelectSession?: (id: string) => void }) {
   const container = useRef<HTMLDivElement>(null)
   const bottom = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
@@ -58,13 +60,17 @@ export default function Conversation({ session, onError }: { session: Session; o
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }}><div className="transcript-inner">
+    {session.events.some(event => event.type === 'tool') ? <details className="activity-summary"><summary>Activity · {session.events.filter(event => event.type === 'tool').length} actions</summary>
+      <ol>{session.events.filter(event => event.type === 'tool').map(event => <li key={event.id}><span>{(event.name || 'Tool').replace(/_/g, ' ')}</span><small>{event.state}</small></li>)}</ol>
+    </details> : null}
+    {session.parent_session_id && onSelectSession ? <button className="outline parent-conversation" onClick={() => onSelectSession(session.parent_session_id!)}>Back to parent conversation</button> : null}
     {session.events.map(event => {
-      if (event.type === 'user') return <div className="user-message" key={event.id}>{event.text}</div>
+      if (event.type === 'user') return <div className="user-message" key={event.id}>{event.text}{event.child_session_id && onSelectSession ? <button className="outline" onClick={() => onSelectSession(event.child_session_id!)}>Open subagent</button> : null}</div>
       if (event.type === 'tool') return <ToolCard key={event.id} event={event} sessionId={session.id} onError={onError} />
-      if (event.type === 'assistant') return event.text ? <Reply key={event.id} text={event.text} /> : null
-      return <div className={`conversation-notice ${event.type === 'error' ? 'error' : ''}`} key={event.id}>{event.text}</div>
+      if (event.type === 'assistant') return event.text || event.reasoning_summary ? <Reply key={event.id} text={event.text || ''} reasoning={event.reasoning_summary} truncated={event.reasoning_truncated} /> : null
+      return <div className={`conversation-notice ${event.type === 'error' ? 'error' : ''}`} key={event.id}>{event.text}{event.child_session_id && onSelectSession ? <button className="outline" onClick={() => onSelectSession(event.child_session_id!)}>Open subagent</button> : null}</div>
     })}
-    {session.status === 'running' ? <div className="working-indicator"><span /><span /><span /><span className="sr-only">Working</span></div> : null}
+    {['running', 'delegating'].includes(session.status) ? <div className="working-indicator"><span /><span /><span /><span className="sr-only">Working</span></div> : null}
     <div ref={bottom} />
   </div></div>
 }

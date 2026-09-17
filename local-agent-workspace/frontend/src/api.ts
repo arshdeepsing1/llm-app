@@ -14,6 +14,10 @@ export function streamUrl(id: string) {
   return `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/sessions/${id}/stream`
 }
 export function streamProtocols() { return ['local-workspace', token] }
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) { super(message); this.status = status }
+}
 export async function api<T>(path: string, method = 'GET', body?: unknown, retried = false): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method, headers: { 'Content-Type': 'application/json', 'X-Local-Token': token },
@@ -26,6 +30,6 @@ export async function api<T>(path: string, method = 'GET', body?: unknown, retri
     await refreshToken()
     return api<T>(path, method, body, true)
   }
-  if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data))
+  if (!response.ok) throw new ApiError(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data), response.status)
   return data
 }

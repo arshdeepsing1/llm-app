@@ -14,9 +14,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
 from .config import APP_ROOT, Settings
+from .context import MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW
 from .store import Store
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
+from .feature_api import register_features
 
 
 class Prompt(BaseModel):
@@ -44,12 +46,16 @@ class FileEdit(BaseModel):
 
 class SettingsEdit(BaseModel):
     workspace: str
-    runtime: str
     model: str
     env_file: str
-    claude_cli_path: str = ""
-    claude_mcp_config: str = ""
-    claude_skills: bool = False
+    context_window: int | None = Field(default=None, ge=MIN_CONTEXT_WINDOW, le=MAX_CONTEXT_WINDOW, strict=True)
+
+
+class CommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=50000)
+    timeout_seconds: int = Field(default=60, ge=1, le=3600, strict=True)
+    max_output_bytes: int = Field(default=80000, ge=1024, le=1000000, strict=True)
+    background: bool = Field(default=False, strict=True)
 
 
 def create_app(settings=None):
@@ -57,11 +63,13 @@ def create_app(settings=None):
     store = Store(settings.state_dir / "conversations.sqlite3")
     manager = AgentManager(store, settings)
     local_token = secrets.token_urlsafe(32)
+    deleting_sessions = set()
 
     @asynccontextmanager
     async def lifespan(app):
         yield
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
+        await manager.jobs.shutdown()
         store.db.close()
 
     app = FastAPI(title="Local workspace", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -98,6 +106,8 @@ def create_app(settings=None):
         return JSONResponse({"detail": settings.redact(file_error(error))}, status_code=400)
 
     def session_or_404(session_id):
+        if session_id in deleting_sessions:
+            raise HTTPException(404, "Conversation is being deleted.")
         session = manager.get(session_id)
         if not session:
             raise HTTPException(404, "Conversation not found.")
@@ -134,13 +144,12 @@ def create_app(settings=None):
     async def connection():
         try:
             host, token = settings.credentials()
-            path = "/ai-gateway/anthropic/v1/models" if settings.values["runtime"] == "claude" else "/api/2.0/serving-endpoints"
             async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-                response = await client.get(host + path, headers={"Authorization": f"Bearer {token}"})
+                response = await client.get(host + "/api/2.0/serving-endpoints", headers={"Authorization": f"Bearer {token}"})
             if response.status_code != 200:
                 return {"connected": False, "models": [], "error": f"Databricks returned HTTP {response.status_code}. Check your credentials and access."}
             data = response.json()
-            models = [item.get("name", item.get("id", "")) for item in data.get("endpoints", data.get("data", []))]
+            models = [item.get("name", "") for item in data.get("endpoints", [])]
             models = [name for name in models if name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
             return {"connected": True, "models": models, "error": None}
         except (ValueError, httpx.HTTPError) as exc:
@@ -148,7 +157,8 @@ def create_app(settings=None):
 
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):
-        return settings.update(body.model_dump())
+        manager.workspace_available(body.workspace)
+        return settings.update(body.model_dump(exclude_none=True))
 
     @app.get("/api/sessions")
     async def list_sessions():
@@ -156,6 +166,7 @@ def create_app(settings=None):
 
     @app.post("/api/sessions")
     async def create_session(body: SessionPermissions | None = None):
+        manager.workspace_available(settings.values["workspace"])
         session = store.create(settings.values)
         session["permission_mode"] = body.permission_mode if body else "manual"
         store.save(session)
@@ -205,10 +216,17 @@ def create_app(settings=None):
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str):
         session_or_404(session_id)
-        await manager.stop(session_id)
-        store.delete(session_id)
-        manager.live.pop(session_id, None)
-        manager.statuses.pop(session_id, None)
+        deleting_sessions.add(session_id)
+        try:
+            await manager.stop(session_id)
+            await manager.jobs.remove_session(session_id)
+            manager.task_board.delete_session(session_id)
+            manager.checkpoints.delete_session(session_id)
+            store.delete(session_id)
+            manager.live.pop(session_id, None)
+            manager.statuses.pop(session_id, None)
+        finally:
+            deleting_sessions.discard(session_id)
         return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/messages")
@@ -265,7 +283,7 @@ def create_app(settings=None):
         tools = workspace_tools(body.session_id)
         if tools.read_file(body.path) != body.original:
             raise HTTPException(409, "This file changed on disk. Reopen it before saving.")
-        tools.change("write_file", {"path": body.path, "content": body.content}, apply=True)
+        manager.checkpoints.apply_edit(tools, "write_file", {"path": body.path, "content": body.content}, session_id=body.session_id)
         return {"ok": True}
 
     @app.get("/api/git")
@@ -276,11 +294,54 @@ def create_app(settings=None):
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):
-        # Clicking Run in the terminal panel is explicit user authorization.
+        # Compatibility for existing API clients; new UI uses observable /jobs.
+        workspace = str(workspace_tools(session_id).root)
+        manager.workspace_available(workspace)
+        job = await manager.jobs.start(body.text, workspace, session_id=session_id)
         try:
-            return await workspace_tools(session_id).run_command(body.text)
-        except TimeoutError:
+            job = await manager.jobs.wait(job["id"])
+        except asyncio.CancelledError:
+            await manager.jobs.stop(job["id"])
+            raise
+        if job["state"] == "timed_out":
             raise HTTPException(408, "Command stopped after 60 seconds.")
+        return {"job_id": job["id"], "exit_code": job["exit_code"], "output": job["output"], "truncated": job["truncated"]}
+
+    def job_scope(session_id):
+        session = session_or_404(session_id) if session_id else None
+        return str(Path(session["workspace"] if session else settings.values["workspace"]).expanduser().resolve())
+
+    def scoped_job(job_id, session_id):
+        workspace = job_scope(session_id)
+        job = manager.jobs.get(job_id)
+        if not job or job["session_id"] != session_id or job["workspace"] != workspace:
+            raise HTTPException(404, "Job not found in this conversation or workspace.")
+        return job
+
+    @app.get("/api/jobs")
+    async def list_jobs(session_id: str | None = None):
+        workspace = job_scope(session_id)
+        return [{key: value for key, value in job.items() if key != "output"}
+                for job in manager.jobs.list(session_id=session_id, workspace=workspace)
+                if job["session_id"] == session_id]
+
+    @app.post("/api/jobs")
+    async def start_job(body: CommandRequest, session_id: str | None = None):
+        # Clicking Run explicitly authorizes this command, independent of agent mode.
+        workspace = job_scope(session_id)
+        manager.workspace_available(workspace)
+        return await manager.jobs.start(workspace=workspace, session_id=session_id, **body.model_dump())
+
+    @app.get("/api/jobs/{job_id}")
+    async def get_job(job_id: str, session_id: str | None = None):
+        return scoped_job(job_id, session_id)
+
+    @app.post("/api/jobs/{job_id}/stop")
+    async def stop_job(job_id: str, session_id: str | None = None):
+        scoped_job(job_id, session_id)
+        return await manager.jobs.stop(job_id)
+
+    register_features(app, manager, settings, store, session_or_404, workspace_tools)
 
     dist = APP_ROOT / "frontend" / "dist"
     if (dist / "assets").is_dir():

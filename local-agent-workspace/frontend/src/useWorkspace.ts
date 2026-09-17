@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, refreshToken, setToken, streamProtocols, streamUrl } from './api'
-import type { AgentEvent, Connection, PermissionMode, Session, Settings } from './types'
+import { api, ApiError, refreshToken, setToken, streamProtocols, streamUrl } from './api'
+import type { AgentEvent, Connection, ContextInfo, PermissionMode, Session, Settings } from './types'
 
 type Selection = { id: string | null; key: string; creating?: Promise<Session> }
 const sessionInUrl = () => new URL(window.location.href).searchParams.get('session')
@@ -16,6 +16,7 @@ export function useWorkspace() {
   })
   const selected = useRef<Selection>({ ...selection })
   const draftKeys = useRef(new Map<string, string>())
+  const contextUpdates = useRef(new Map<string, ContextInfo>())
   const activeId = selection.id
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
@@ -36,8 +37,21 @@ export function useWorkspace() {
     if (!id) setDraftMode('manual')
     if (!fromHistory) updateUrl(id)
   }, [updateUrl])
+  const clearMissingSession = useCallback(() => {
+    selectSession(null, true)
+    updateUrl(null, true)
+    setError('That conversation no longer exists. Start a new conversation below.')
+  }, [selectSession, updateUrl])
 
-  const refreshSessions = useCallback(async () => setSessions(await api<Session[]>('/sessions')), [])
+  const refreshSessions = useCallback(async () => {
+    const atStart = new Map(contextUpdates.current)
+    const list = await api<Session[]>('/sessions')
+    // Preserve context streamed after this summary request began.
+    setSessions(list.map(item => {
+      const context = contextUpdates.current.get(item.id)
+      return context && context !== atStart.get(item.id) ? { ...item, context_info: context } : item
+    }))
+  }, [])
   const checkConnection = useCallback(async () => {
     setConnection(null)
     const result = await api<Connection>('/connection')
@@ -57,15 +71,13 @@ export function useWorkspace() {
       setSessions(list)
       // Only an explicit conversation URL resumes history. The root page is new.
       if (selected.current.id && !list.some(s => s.id === selected.current.id)) {
-        selectSession(null, true)
-        updateUrl(null, true)
-        setError('That conversation no longer exists. Start a new conversation below.')
+        clearMissingSession()
       }
       setReady(true)
       await checkConnection()
     })().catch(e => setError(e.message))
     return () => { mounted = false }
-  }, [checkConnection, selectSession, updateUrl])
+  }, [checkConnection, clearMissingSession])
 
   useEffect(() => {
     const onPopState = () => selectSession(sessionInUrl(), true)
@@ -83,9 +95,20 @@ export function useWorkspace() {
     setSession(null)
     let reconnect = false
     const connect = async () => {
-      if (reconnect) {
-        try { await refreshToken() }
-        catch { if (!closed) timer = setTimeout(() => void connect(), 2000); return }
+      try {
+        if (reconnect) await refreshToken()
+        // A rejected WebSocket handshake cannot distinguish a missing chat
+        // from an expired token. Check existence before opening or retrying it.
+        await api(`/sessions/${activeId}`)
+      } catch (error) {
+        if (!isCurrent()) return
+        if (error instanceof ApiError && error.status === 404) {
+          clearMissingSession()
+          void refreshSessions().catch(e => setError(e.message))
+        } else {
+          reconnect = true; setOnline(false); timer = setTimeout(() => void connect(), 2000)
+        }
+        return
       }
       if (!isCurrent()) return
       socket = new WebSocket(streamUrl(activeId), streamProtocols())
@@ -93,10 +116,20 @@ export function useWorkspace() {
       socket.onmessage = message => {
         if (!isCurrent()) return
         const data = JSON.parse(message.data)
-        if (data.type === 'snapshot' && data.session.id === activeId) setSession(data.session)
+        if (data.type === 'snapshot' && data.session.id === activeId) {
+          if (data.session.context_info) contextUpdates.current.set(activeId, data.session.context_info)
+          setSession(data.session)
+          void refreshSessions().catch(e => setError(e.message))
+        }
         if (data.type === 'permissions') setSession(current => current?.id === activeId ? {
           ...current, permission_mode: data.permission_mode, allowed_directories: data.allowed_directories,
         } : current)
+        if (data.type === 'context') {
+          contextUpdates.current.set(activeId, data.context_info)
+          setSession(current => current?.id === activeId ? { ...current, context_info: data.context_info } : current)
+          setSessions(current => current.map(item => item.id === activeId ? { ...item, context_info: data.context_info } : item))
+        }
+        if (data.type === 'event' && data.event.child_session_id) void refreshSessions().catch(e => setError(e.message))
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
           const event = data.event as AgentEvent
@@ -121,7 +154,7 @@ export function useWorkspace() {
     }
     void connect()
     return () => { closed = true; clearTimeout(timer); socket?.close() }
-  }, [activeId, selection.key, ready, refreshSessions])
+  }, [activeId, selection.key, ready, refreshSessions, clearMissingSession])
 
   const newConversation = () => selectSession(null)
   const ensureSession = async (target: Selection) => {
@@ -147,7 +180,8 @@ export function useWorkspace() {
     await api(`/sessions/${id}/messages`, 'POST', { text })
   }
   const saveSettings = async (next: Settings) => {
-    const saved = await api<Settings>('/settings', 'PUT', next)
+    const { workspace, model, env_file, context_window } = next
+    const saved = await api<Settings>('/settings', 'PUT', { workspace, model, env_file, context_window })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
   }
@@ -160,20 +194,26 @@ export function useWorkspace() {
     const target = selected.current
     if (activeId) {
       const updated = await api<Session>(`/sessions/${activeId}/permissions`, 'PUT', { permission_mode })
-      if (selected.current === target) setSession(updated)
+      if (selected.current === target) setSession(current => current?.id === updated.id ? {
+        ...current, permission_mode: updated.permission_mode,
+      } : current)
     } else setDraftMode(permission_mode)
   }
   const allowFolder = async (path: string) => {
     const target = selected.current
     const id = await ensureSession(target)
     const updated = await api<Session>(`/sessions/${id}/folders`, 'POST', { path })
-    if (selected.current === target) setSession(updated)
+    if (selected.current === target) setSession(current => current?.id === updated.id ? {
+      ...current, allowed_directories: updated.allowed_directories,
+    } : current)
   }
   const removeFolder = async (path: string) => {
     const target = selected.current
     if (activeId) {
       const updated = await api<Session>(`/sessions/${activeId}/folders`, 'DELETE', { path })
-      if (selected.current === target) setSession(updated)
+      if (selected.current === target) setSession(current => current?.id === updated.id ? {
+        ...current, allowed_directories: updated.allowed_directories,
+      } : current)
     }
   }
   const activeSession = session?.id === activeId ? session : null

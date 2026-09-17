@@ -1,22 +1,22 @@
-import { useCallback, useEffect, useState } from 'react'
-import { ArrowLeft, ChevronRight, File, Folder, GitBranch, LoaderCircle, Plus, RefreshCw, Save, Terminal, X } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type SetStateAction } from 'react'
+import { ArrowLeft, ChevronRight, File, Folder, GitBranch, Plus, RefreshCw, Save, Terminal, X } from 'lucide-react'
 import { api } from '../api'
 import type { FileEntry } from '../types'
+import TerminalPanel from './TerminalPanel'
 
-type OpenFile = { path: string; content: string; original: string }
-export default function WorkspacePanel({ sessionId, workspace, onClose, onAttach }: {
+export type OpenFile = { id: string; path: string; content: string; original: string }
+export default function WorkspacePanel({ sessionId, workspace, file, setFile, onClose, onAttach }: {
   sessionId: string | null; workspace: string; onClose: () => void; onAttach: (path: string) => void;
+  file: OpenFile | null; setFile: (value: SetStateAction<OpenFile | null>) => void;
 }) {
   const [tab, setTab] = useState('files')
   const [directory, setDirectory] = useState('.')
   const [files, setFiles] = useState<FileEntry[]>([])
-  const [file, setFile] = useState<OpenFile | null>(null)
   const [changes, setChanges] = useState('')
-  const [command, setCommand] = useState('')
-  const [output, setOutput] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const [running, setRunning] = useState(false)
+  const openRequest = useRef(0)
+  useEffect(() => () => { openRequest.current++ }, [])
   const query = sessionId ? `session_id=${sessionId}` : ''
   const refresh = useCallback(async () => {
     setLoading(true); setError('')
@@ -33,33 +33,26 @@ export default function WorkspacePanel({ sessionId, workspace, onClose, onAttach
   const dirty = file && file.content !== file.original
   const openFile = async (path: string) => {
     if (dirty && !confirm('Discard your unsaved edits?')) return
+    const request = ++openRequest.current
     setError('')
     try {
       const result = await api<{ content: string }>(`/file?path=${encodeURIComponent(path)}&${query}`)
-      setFile({ path, content: result.content, original: result.content })
-    } catch (e) { setError((e as Error).message) }
+      if (request === openRequest.current) setFile({ id: crypto.randomUUID(), path, content: result.content, original: result.content })
+    } catch (e) { if (request === openRequest.current) setError((e as Error).message) }
   }
   const save = async () => {
     if (!file) return
     setLoading(true); setError('')
     try {
-      await api('/file', 'PUT', { ...file, session_id: sessionId })
-      setFile({ ...file, original: file.content })
+      await api('/file', 'PUT', { path: file.path, content: file.content, original: file.original, session_id: sessionId })
+      setFile(current => current?.id === file.id && current.original === file.original
+        ? { ...current, original: file.content } : current)
     } catch (e) { setError((e as Error).message) }
     finally { setLoading(false) }
   }
-  const run = async () => {
-    if (!command.trim() || running) return
-    setRunning(true); setError(''); setOutput(`$ ${command}\n\n`)
-    try {
-      const result = await api<{ output: string; exit_code: number }>(`/command?${query}`, 'POST', { text: command })
-      setOutput(`$ ${command}\n\n${result.output}\n[exit ${result.exit_code}]`)
-    } catch (e) { setError((e as Error).message) }
-    finally { setRunning(false) }
-  }
   return <aside className="workspace-panel" aria-label="Workspace panel">
     <header><div><h2>Workspace</h2><p title={workspace}>{workspace.split('/').filter(Boolean).pop()}</p></div>
-      <button className="icon-button" aria-label="Close workspace" onClick={() => { if (!dirty || confirm('Discard your unsaved edits?')) onClose() }}><X size={19} /></button></header>
+      <button className="icon-button" aria-label="Close workspace" onClick={onClose}><X size={19} /></button></header>
     <nav className="workspace-tabs" aria-label="Workspace views">
       <button className={tab === 'files' ? 'active' : ''} onClick={() => setTab('files')}><Folder size={15} />Files</button>
       <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}><GitBranch size={15} />Changes</button>
@@ -85,10 +78,6 @@ export default function WorkspacePanel({ sessionId, workspace, onClose, onAttach
       </div>}
     </> : tab === 'changes' ? <div className="changes-view"><div className="file-path"><span>Working tree</span><button className="icon-button" aria-label="Refresh changes" onClick={() => void refresh()}><RefreshCw size={15} className={loading ? 'spin' : ''} /></button></div>
       <pre className="diff-output">{changes.split('\n').map((line, i) => <span key={i} className={line.startsWith('+') ? 'added' : line.startsWith('-') ? 'removed' : ''}>{line}{'\n'}</span>)}</pre></div> :
-      <div className="terminal-view"><p>Run a command in your project folder.</p><form onSubmit={e => { e.preventDefault(); void run() }}>
-        <span>$</span><input aria-label="Shell command" placeholder="git status" value={command} onChange={e => setCommand(e.target.value)} disabled={running} />
-        <button className="primary" disabled={running || !command.trim()}>{running ? <LoaderCircle size={14} className="spin" /> : 'Run'}</button></form>
-        <p className="field-help">Runs when you click Run. Commands can access your machine. Non-interactive, up to 60 seconds.</p>
-        <pre className="terminal-output">{output || 'Command output will appear here.'}</pre></div>}
+      <TerminalPanel sessionId={sessionId} workspace={workspace} />}
   </aside>
 }

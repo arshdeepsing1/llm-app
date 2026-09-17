@@ -17,7 +17,7 @@ def setup(tmp_path):
     project = tmp_path / 'project'
     project.mkdir()
     settings = Settings(tmp_path / 'state')
-    settings.values.update(workspace=str(project), env_file='', runtime='databricks')
+    settings.values.update(workspace=str(project), env_file='')
     store = Store(settings.state_dir / 'tests.sqlite3')
     yield settings, store, WorkspaceTools(str(project))
     store.db.close()
@@ -55,7 +55,8 @@ async def test_external_csv_listing_requires_access_and_remembers_grant(setup, t
     assert saved['allowed_directories'] == [str(downloads)]
     restored_tools = WorkspaceTools(str(tools.root), allowed_directories=saved['allowed_directories'])
     assert restored_tools.read_file(str(downloads / 'report.CSV')) == 'value\n1\n'
-    assert 'report.CSV:1: value' in restored_tools.search_files('value', path=str(downloads))
+    matches = restored_tools.search_files('value', path=str(downloads))['matches']
+    assert [(match['path'], match['line'], match['text']) for match in matches] == [(str(downloads / 'report.CSV'), 1, 'value')]
     with pytest.raises(ValueError):
         restored_tools.read_file(str(downloads / '.env'))
     # A sibling of the approved directory is still outside the grant.
@@ -87,13 +88,13 @@ async def test_automatic_edits_do_not_wait_for_approval(setup, mode):
     assert not manager.pending
 
 
-async def test_plan_blocks_writes_commands_and_delegation(setup):
+async def test_plan_blocks_writes_and_commands(setup):
     settings, store, tools = setup
     manager = AgentManager(store, settings)
     session = store.create(settings.values)
     session['permission_mode'] = 'plan'
     for name, arguments in [('write_file', {'path': 'blocked.txt', 'content': 'no'}),
-                            ('run_command', {'command': 'touch blocked.txt'}), ('Agent', {'prompt': 'do something'})]:
+                            ('run_command', {'command': 'touch blocked.txt'})]:
         result = await manager.execute_tool(session, tools, name, arguments, name)
         assert 'read-only' in result
     assert not (tools.root / 'blocked.txt').exists()
@@ -104,7 +105,6 @@ async def test_plan_blocks_writes_commands_and_delegation(setup):
 @pytest.mark.parametrize('command', ['pwd; touch changed', 'ls > changed', 'ls $(touch changed)', 'python -c "print(1)"', 'ls ../private', 'ls\ntouch changed'])
 def test_auto_does_not_classify_arbitrary_shell_as_read_only(command):
     assert tool_decision('auto', 'run_command', {'command': command}) == 'ask'
-    assert tool_decision('auto', 'Bash', {'command': command}) == 'ask'
 
 
 async def test_auto_runs_basic_command_using_os_binary(setup, monkeypatch):
@@ -148,40 +148,6 @@ def test_permissions_api_validates_persists_and_rejects_active_changes(setup):
         assert client.get(f'/api/sessions/{sid}', headers=headers).json()['permission_mode'] == 'acceptEdits'
         app.state.manager.statuses[sid] = 'awaiting_approval'
         assert client.put(route, json={'permission_mode': 'bypassPermissions'}, headers=headers).status_code == 409
-
-
-@pytest.mark.parametrize('mode', ['manual', 'auto', 'acceptEdits', 'plan', 'bypassPermissions'])
-async def test_sdk_hooks_enforce_selected_policy(setup, monkeypatch, mode):
-    import claude_agent_sdk
-    settings, store, _ = setup
-    settings.credentials = lambda: ('https://workspace.example', 'test-token')
-    session = store.create(settings.values)
-    session['permission_mode'] = mode
-    captured = {}
-
-    class FakeClient:
-        def __init__(self, options):
-            captured['options'] = options
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def query(self, prompt):
-            pass
-        async def receive_response(self):
-            yield type('ResultMessage', (), {'session_id': 'session', 'is_error': False})()
-
-    monkeypatch.setattr(claude_agent_sdk, 'ClaudeSDKClient', FakeClient)
-    manager = AgentManager(store, settings)
-    await manager.run_claude(session, 'hello')
-    hook = captured['options'].hooks['PreToolUse'][0].hooks[0]
-    for name, arguments in [('Read', {'file_path': 'hello.txt'}), ('Write', {'file_path': 'result.txt'}),
-                            ('Bash', {'command': 'touch result.txt'}), ('Bash', {'command': 'pwd'}),
-                            ('Agent', {'prompt': 'write files'}), ('mcp__server__action', {})]:
-        result = await hook({'tool_name': name, 'tool_input': arguments}, 'tool', {})
-        assert result['hookSpecificOutput']['permissionDecision'] == tool_decision(mode, name, arguments)
-    secret = await hook({'tool_name': 'Read', 'tool_input': {'file_path': '.env'}}, 'secret', {})
-    assert secret['hookSpecificOutput']['permissionDecision'] == 'deny'
 
 
 async def test_os_folder_denial_is_distinct_from_chat_permissions(setup, monkeypatch):

@@ -18,8 +18,8 @@ class Store:
     def create(self, settings: dict):
         now = time.time()
         session = {"id": str(uuid.uuid4()), "title": "New conversation", "created": now,
-                   "updated": now, "workspace": settings["workspace"], "runtime": settings["runtime"],
-                   "model": settings["model"], "events": [], "wire": [], "sdk_id": None,
+                   "updated": now, "workspace": settings["workspace"],
+                   "model": settings["model"], "events": [], "wire": [],
                    "permission_mode": "manual", "allowed_directories": []}
         self.save(session)
         return session
@@ -36,7 +36,8 @@ class Store:
 
     def list(self):
         rows = self.db.execute("SELECT data FROM sessions ORDER BY updated DESC").fetchall()
-        return [{k: v for k, v in json.loads(row[0]).items() if k not in ("wire", "events")} for row in rows]
+        return [{k: v for k, v in json.loads(row[0]).items()
+                 if k not in ("wire", "events", "context_state", "instruction_directories")} for row in rows]
 
     def delete(self, session_id):
         self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))

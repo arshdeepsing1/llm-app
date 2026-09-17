@@ -20,7 +20,7 @@ def setup(tmp_path):
     workspace.mkdir()
     (workspace / "hello.txt").write_text("hello\n")
     settings = Settings(tmp_path / "state")
-    settings.values.update(workspace=str(workspace), env_file="", runtime="databricks")
+    settings.values.update(workspace=str(workspace), env_file="")
     store = Store(settings.state_dir / "tests.sqlite3")
     yield settings, store, WorkspaceTools(str(workspace))
     store.db.close()
@@ -49,8 +49,8 @@ def test_search_never_reads_credentials(setup):
     (tools.root / ".env").write_text("findthis secret")
     (tools.root / "public.txt").write_text("findthis public")
     result = tools.search_files("findthis")
-    assert "public.txt:1" in result
-    assert "secret" not in result
+    assert [(match["path"], match["line"]) for match in result["matches"]] == [("public.txt", 1)]
+    assert "secret" not in json.dumps(result)
 
 
 def test_edit_requires_unique_match_and_preview_does_not_write(setup):
@@ -96,7 +96,7 @@ async def test_approval_cannot_overwrite_a_newer_disk_edit(setup):
 async def test_shell_does_not_inherit_gateway_token(setup, monkeypatch):
     _, _, tools = setup
     monkeypatch.setenv("DBRICKS_TOKEN", "test-secret-value")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "second-secret")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "second-secret")
     result = await tools.run_command('/usr/bin/env')
     assert result["exit_code"] == 0
     assert "test-secret-value" not in result["output"]
@@ -181,40 +181,6 @@ def test_provider_reasoning_is_not_rendered_as_answer():
     assert visible_text("plain answer") == "plain answer"
 
 
-@pytest.mark.parametrize("resume", [None, "prior-session"])
-async def test_sdk_adapter_passes_gateway_config_and_resumes(setup, monkeypatch, resume):
-    import claude_agent_sdk
-    settings, store, _ = setup
-    settings.credentials = lambda: ("https://test.cloud.databricks.com", "secret-test-token")
-    settings.values.update(runtime="claude", model="system.ai.test-claude")
-    session = store.create(settings.values)
-    session["sdk_id"] = resume
-    captured = {}
-
-    class FakeClient:
-        def __init__(self, options):
-            captured["options"] = options
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def query(self, prompt):
-            captured["prompt"] = prompt
-        async def receive_response(self):
-            yield type("ResultMessage", (), {"session_id": "resumed-session", "is_error": False})()
-
-    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", FakeClient)
-    manager = AgentManager(store, settings)
-    await manager.run_claude(session, "hello")
-    options = captured["options"]
-    assert options.resume == resume
-    assert options.env["ANTHROPIC_BASE_URL"] == "https://test.cloud.databricks.com/ai-gateway/anthropic"
-    assert options.env["ANTHROPIC_AUTH_TOKEN"] == "secret-test-token"
-    assert options.model == "system.ai.test-claude"
-    assert options.can_use_tool is not None
-    assert session["sdk_id"] == "resumed-session"
-
-
 async def test_same_greeting_sessions_have_separate_model_context_after_resume(setup, monkeypatch):
     settings, store, _ = setup
     settings.credentials = lambda: ("https://gateway.example", "test-token")
@@ -239,7 +205,6 @@ async def test_same_greeting_sessions_have_separate_model_context_after_resume(s
         saved = store.get(session["id"])
         assert saved["title"] == "HI"
         assert [m["content"] for m in saved["wire"] if m["role"] == "user"] == ["HI"]
-        assert saved["sdk_id"] is None
         assert saved["allowed_directories"] == []
 
     manager.start(first["id"], "Remember alpha-only-4829.")
