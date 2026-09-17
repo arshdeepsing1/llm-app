@@ -212,13 +212,16 @@ async def test_same_greeting_sessions_have_separate_model_context_after_resume(s
     manager.start(second["id"], "What have I said in this chat?")
     await manager.tasks[second["id"]]
     assert "alpha-only-4829" not in json.dumps(requests[-1])
-    assert [m["content"] for m in requests[-1]["messages"] if m["role"] == "user"] == [
+    resumed = next(request for request in reversed(requests) if request["stream"])
+    assert "alpha-only-4829" not in json.dumps(resumed)
+    assert [m["content"] for m in resumed["messages"] if m["role"] == "user"] == [
         "HI", "What have I said in this chat?"]
 
     # Reopening the persisted session restores only that session's context.
     manager = AgentManager(store, settings)
     manager.start(first["id"], "Recall my marker.")
     await manager.tasks[first["id"]]
-    assert [m["content"] for m in requests[-1]["messages"] if m["role"] == "user"] == [
+    resumed = next(request for request in reversed(requests) if request["stream"])
+    assert [m["content"] for m in resumed["messages"] if m["role"] == "user"] == [
         "HI", "Remember alpha-only-4829.", "Recall my marker."]
     assert len([e for e in store.get(second["id"])["events"] if e["type"] == "user"]) == 2

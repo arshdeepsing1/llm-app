@@ -17,6 +17,7 @@ export function useWorkspace() {
   const selected = useRef<Selection>({ ...selection })
   const draftKeys = useRef(new Map<string, string>())
   const contextUpdates = useRef(new Map<string, ContextInfo>())
+  const sessionsRequest = useRef(0)
   const activeId = selection.id
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
@@ -44,8 +45,11 @@ export function useWorkspace() {
   }, [selectSession, updateUrl])
 
   const refreshSessions = useCallback(async () => {
+    const request = ++sessionsRequest.current
     const atStart = new Map(contextUpdates.current)
     const list = await api<Session[]>('/sessions')
+    // Older summaries must not undo a title event and its newer refresh.
+    if (request !== sessionsRequest.current) return
     // Preserve context streamed after this summary request began.
     setSessions(list.map(item => {
       const context = contextUpdates.current.get(item.id)
@@ -145,6 +149,7 @@ export function useWorkspace() {
         }
         if (data.type === 'title') {
           setSession(current => current?.id === activeId ? { ...current, title: data.title } : current)
+          setSessions(current => current.map(item => item.id === activeId ? { ...item, title: data.title } : item))
           void refreshSessions().catch(e => setError(e.message))
         }
       }

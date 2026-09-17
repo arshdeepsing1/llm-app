@@ -136,7 +136,8 @@ async def test_cancelled_after_hook_approval_preserves_completed_result_for_resu
     assert not manager.pending
     manager.start(session["id"], "Continue")
     await manager.tasks[session["id"]]
-    recovered = next(message for message in requests[-1]["messages"] if message.get("tool_call_id") == "write-call")
+    resumed = next(request for request in reversed(requests) if request["stream"])
+    recovered = next(message for message in resumed["messages"] if message.get("tool_call_id") == "write-call")
     assert recovered["content"] == edit["output"]
 
 

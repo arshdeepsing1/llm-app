@@ -135,6 +135,15 @@ start a new conversation if those paths differ on the destination laptop.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+- **Conversation titles**: the opening message supplies an immediate temporary title.
+  After a successful reply, the same Databricks model creates a short heading for
+  the sidebar and chat header. This uses one additional model request, billed by
+  your endpoint, with a 10-second timeout. Only brief excerpts of the opening message
+  and answer are sent; title generation does not alter the conversation context.
+  Successful titles are saved and reused after restart. If naming fails or you stop
+  it, the temporary title stays and naming can retry after a later successful reply.
+  Older automatically named chats are eligible when resumed; custom and worktree
+  titles are preserved.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
   the plus button to reference the file in chat. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,

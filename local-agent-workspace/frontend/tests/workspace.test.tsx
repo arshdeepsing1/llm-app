@@ -334,6 +334,59 @@ describe('editor drafts', () => {
 })
 
 describe('session synchronization', () => {
+  it('shows a generated title immediately and ignores an older sidebar response', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const { result } = renderHook(useWorkspace)
+    const socket = await showSession('a')
+    const oldList = [...sessions.values()]
+    const older = deferred<Response>()
+    const newer = deferred<Response>()
+    let requests = 0
+    override = path => path === '/api/sessions' ? ++requests === 1 ? older.promise : newer.promise : undefined
+    let oldRefresh!: Promise<void>
+    act(() => { oldRefresh = result.current.refreshSessions() })
+    const title = 'Fix Parser Token Boundaries'
+    sessions.set('a', { ...sessions.get('a')!, title })
+    act(() => socket.emit({ type: 'title', title }))
+    expect(result.current.session?.title).toBe(title)
+    expect(result.current.sessions.find(item => item.id === 'a')?.title).toBe(title)
+    await act(async () => { newer.resolve(json([...sessions.values()])) })
+    await act(async () => { older.resolve(json(oldList)); await oldRefresh })
+    expect(result.current.session?.title).toBe(title)
+    expect(result.current.sessions.find(item => item.id === 'a')?.title).toBe(title)
+  })
+
+  it('preserves generated sidebar and topbar titles through conversation switches and late old responses', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    sessions.set('b', makeSession('b', 'Second conversation'))
+    await renderApp()
+    const firstSocket = await showSession('a')
+    const oldList = [...sessions.values()]
+    const older = deferred<Response>()
+    let requests = 0
+    override = path => path === '/api/sessions' && ++requests === 1 ? older.promise : undefined
+    act(() => firstSocket.emit({ type: 'status', status: 'idle' }))
+    const title = 'Fix Parser Token Boundaries'
+    sessions.set('a', { ...sessions.get('a')!, title })
+    act(() => firstSocket.emit({ type: 'title', title }))
+    expect(screen.getByRole('button', { name: /^Fix Parser Token Boundaries/ })).toBeTruthy()
+    expect(within(screen.getByRole('main')).getByText(title)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /^Second conversation/ }))
+    await showSession('b')
+    await act(async () => {
+      firstSocket.emit({ type: 'title', title: 'Ignored abandoned socket title' })
+      older.resolve(json(oldList))
+    })
+    expect(within(screen.getByRole('main')).getByText('Second conversation')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Fix Parser Token Boundaries/ })).toBeTruthy()
+    expect(screen.queryByText('Ignored abandoned socket title')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /^Fix Parser Token Boundaries/ }))
+    await waitFor(() => expect(TestSocket.instances.filter(socket => socket.url.endsWith('/a/stream'))).toHaveLength(2))
+    await showSession('a')
+    expect(within(screen.getByRole('main')).getByText(title)).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Fix Parser Token Boundaries/ })).toBeTruthy()
+  })
+
   it('refreshes sidebar summaries for title and status changes missed before the initial snapshot', async () => {
     window.history.replaceState(null, '', '/?session=a')
     const { result } = renderHook(useWorkspace)

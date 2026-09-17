@@ -66,6 +66,7 @@ export default function App() {
       <div className="chat-composer">{composer}
         {active?.status === 'awaiting_approval' ? <p className="composer-hint" role="status">An action is waiting for your approval above.</p> : null}
         {active?.status === 'compacting' ? <p className="composer-hint" role="status">Compacting context…</p> : null}
+        {active?.status === 'naming' ? <p className="composer-hint" role="status">Creating conversation title…</p> : null}
         <ContextMeter key={`context-${app.viewKey}`} info={active?.context_info} />
       </div>
     </main>

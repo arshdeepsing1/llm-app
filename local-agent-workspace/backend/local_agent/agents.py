@@ -17,6 +17,7 @@ from .extensions import ExtensionManager
 from .planning import TaskManager, DelegateManager
 from .feature_tools import FEATURE_TOOLS
 from .reasoning import reasoning_summary
+from .titles import fallback_title, generate_title, needs_title
 
 
 SYSTEM_PROMPT = """You are Local, a practical coding assistant working in the user's selected workspace.
@@ -301,11 +302,24 @@ class AgentManager:
             await self.status(session, "running")
             await self.event(session, "user", text=prompt)
             if session["title"] == "New conversation":
-                session["title"] = prompt.replace("\n", " ")[:64]
+                session["title"] = fallback_title(prompt)
+                self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
-            await self.run_databricks(session, prompt)
+            completed = await self.run_databricks(session, prompt)
+            if completed and needs_title(session):
+                previous_title = session["title"]
+                await self.status(session, "naming")
+                title = await generate_title(self.settings, session)
+                if title and session["title"] == previous_title:
+                    session.update(title=title, title_generated=True)
+                    self.store.save(session)
+                    await self.broadcast(session["id"], {"type": "title", "title": title})
         except asyncio.CancelledError:
-            await self.event(session, "notice", text="Stopped. You can continue this conversation.")
+            if self.statuses.get(session["id"]) == "naming":
+                # The answer completed; cancelling its title is not cancelled work.
+                asyncio.current_task().uncancel()
+            else:
+                await self.event(session, "notice", text="Stopped. You can continue this conversation.")
         except Exception as exc:
             text = self.settings.redact(str(exc))[:1500] or type(exc).__name__
             await self.event(session, "error", text=text)
@@ -471,7 +485,7 @@ class AgentManager:
             connection.tool_names = {item["function"]["name"] for item in definitions}
             self.extension_connections[session["id"]] = connection
             try:
-                await self._run_databricks(session, prompt, definitions)
+                return await self._run_databricks(session, prompt, definitions)
             finally:
                 self.extension_connections.pop(session["id"], None)
 
@@ -584,7 +598,7 @@ class AgentManager:
                 if not calls:
                     if not event["text"]:
                         raise ValueError("The model returned no response. Try another model in Settings.")
-                    return
+                    return True
                 for call in message["tool_calls"]:
                     try:
                         arguments = json.loads(call["function"]["arguments"])

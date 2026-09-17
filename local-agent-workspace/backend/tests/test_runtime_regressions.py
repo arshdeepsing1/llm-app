@@ -148,7 +148,8 @@ async def test_resume_recovers_completed_tool_result_after_cancelled_broadcast(r
     restarted = AgentManager(manager.store, manager.settings)
     restarted.start(session["id"], "Continue.")
     await restarted.tasks[session["id"]]
-    result = next(message for message in requests[-1]["messages"] if message["role"] == "tool")
+    resumed = next(request for request in reversed(requests) if request["stream"])
+    result = next(message for message in resumed["messages"] if message["role"] == "tool")
     assert result["tool_call_id"] == "write-call"
     assert result["content"] == output
 
