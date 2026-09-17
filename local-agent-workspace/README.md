@@ -45,17 +45,18 @@ Stop the local server with Ctrl+C. It must remain running for the UI and agents 
 
 ## Install / move to another laptop
 
-Tested on macOS with Python 3.12. Shell tools select zsh, bash, or sh, in that order.
-Install Python 3.12+, Node 24.15+ (or Node 22.22.2+), and pnpm 11.19.0.
-The Node minimum includes the frontend test dependencies. Git is needed for the
-Changes panel and worktrees. Native Windows is not supported by the POSIX
-filesystem/process handling; use a Linux
-environment such as WSL for that platform. Linux/WSL have not yet been validated.
+Tested on macOS with Python 3.12. Install Python 3.12+ and Git for the Changes
+panel and worktrees. Shell tools select zsh, bash, or sh, in that order. The built
+`frontend/dist` folder is committed, so a fresh checkout needs no Node.js, pnpm,
+or frontend build to run. Native Windows is not supported by the POSIX
+filesystem/process handling; use a Linux environment such as WSL for that
+platform. Linux/WSL have not yet been validated.
 
-Copy the `local-agent-workspace` folder, including `backend`, `frontend`, and the
-setup files at its root. No sibling repository is required. Recreate the Python
-environment and `frontend/node_modules` on the destination system instead of
-copying them from another laptop.
+Clone the repository or copy the `local-agent-workspace` folder, including
+`backend`, `frontend/dist`, and the setup files at its root. No sibling repository
+is required. Recreate the Python environment on the destination system instead
+of copying it from another laptop. `frontend/node_modules` is not needed to run
+the committed build.
 
 On the new laptop, open a terminal in `local-agent-workspace`. For a fresh
 macOS/Linux/WSL setup, create a local Python environment and install the backend:
@@ -63,8 +64,6 @@ macOS/Linux/WSL setup, create a local Python environment and install the backend
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -c constraints.txt -e ./backend
-pnpm --dir frontend install --frozen-lockfile
-pnpm --dir frontend run build
 cp .env.example .env
 ```
 
@@ -101,8 +100,8 @@ shutdown to finish. Normal shutdown cancels active agent turns and managed comma
 jobs and closes the conversation database. Closing the browser does not stop the
 server. The chat's **Stop** button stops only that response and its foreground
 work, not the server or unrelated background jobs. Restart with the same command;
-saved conversations remain available. Dependency installation and frontend build
-are one-time setup steps unless their source/dependencies change.
+saved conversations remain available. Backend dependency installation is a
+one-time setup step unless those dependencies change.
 
 Saved UI settings are in `.local/settings.json` and override `.env` defaults. Update
 the credential-file path, project folder, and model in **Settings** after migration,
@@ -110,9 +109,9 @@ then start a new conversation. Existing conversations keep their workspace and m
 The credential URL must be the Databricks workspace root, and the selected serving
 endpoint must support streaming and function calling.
 
-If you copy an already-built `frontend/dist`, running the app requires Python and
-its runtime dependencies only (`python -m pip install -c constraints.txt -e ./backend`).
-Node and pnpm are needed to rebuild or develop the frontend, not to serve that bundle.
+The committed `frontend/dist` runs with Python and its runtime dependencies only
+(`python -m pip install -c constraints.txt -e ./backend`). Node and pnpm are needed
+only when changing, rebuilding, or developing the frontend.
 Git and a supported shell are still needed for their respective tools.
 The backend installation automatically installs FastAPI, Uvicorn, HTTPX, regex,
 MCP (`mcp==2.2.0`), and the MCP HTTP transport dependency HTTPX2. No Claude SDK,
@@ -418,6 +417,18 @@ Databricks inference is billed to your workspace. Endpoints must support streami
 function calling, and non-streamed text responses for summarization.
 
 ## Development and checks
+
+For frontend development or rebuilding, install Node 24.x (24.15+) or Node 22.x
+(22.22.2+), and pnpm 11.19.0. Install dependencies and rebuild from the app root:
+
+```bash
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend run build
+```
+
+When frontend source or dependencies change, commit the regenerated
+`frontend/dist` alongside those changes so fresh checkouts remain runnable
+without Node.js or pnpm. The Node minimum also covers frontend test dependencies.
 
 ```bash
 # In this directory, with the chosen Python environment:
