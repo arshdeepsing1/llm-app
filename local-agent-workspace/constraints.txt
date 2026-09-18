@@ -1,6 +1,7 @@
-# Direct runtime versions used for this app's validation.
+# Dependency versions used for this app's validation.
 fastapi==0.141.1
 uvicorn==0.53.0
+websockets==17.1
 httpx==0.28.1
 regex==2026.9.10
 mcp==2.2.0
