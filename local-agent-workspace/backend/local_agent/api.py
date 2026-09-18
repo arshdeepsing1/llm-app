@@ -33,6 +33,10 @@ class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
 
 
+class SessionModel(BaseModel):
+    model: str = Field(min_length=1, max_length=256, strict=True)
+
+
 class FolderAccess(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
 
@@ -181,6 +185,20 @@ def create_app(settings=None):
         store.save(session)
         result = public_session(session)
         await manager.broadcast(session_id, {"type": "snapshot", "session": result})
+        return result
+
+    @app.put("/api/sessions/{session_id}/model")
+    async def change_model(session_id: str, body: SessionModel):
+        session = session_or_404(session_id)
+        if manager.statuses.get(session_id, "idle") != "idle":
+            raise HTTPException(409, "Stop the current response before changing the model.")
+        model = body.model.strip()
+        if not model:
+            raise ValueError("Enter a model endpoint name.")
+        session["model"] = model
+        store.save(session)
+        result = public_session(session)
+        await manager.broadcast(session_id, {"type": "model", "model": model})
         return result
 
     @app.post("/api/sessions/{session_id}/folders")

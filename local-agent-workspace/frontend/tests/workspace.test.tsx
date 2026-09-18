@@ -36,22 +36,28 @@ class TestSocket {
 }
 
 let sessions: Map<string, Session>
+let savedSettings: Settings
 let override: (path: string, options: RequestInit) => Promise<Response> | undefined
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>
 
 beforeEach(() => {
   window.history.replaceState(null, '', '/')
   sessions = new Map([['a', makeSession('a', 'Other conversation')]])
+  savedSettings = { ...settings }
   TestSocket.instances = []
   override = () => undefined
   fetchMock = vi.fn<typeof fetch>(async (input, options = {}) => {
     const path = String(input)
     const response = override(path, options)
     if (response) return response
-    if (path === '/api/bootstrap') return json({ token: 'test-token', settings })
-    if (path === '/api/connection') return json({ connected: true, models: ['test-model'], error: null })
+    if (path === '/api/bootstrap') return json({ token: 'test-token', settings: savedSettings })
+    if (path === '/api/connection') return json({ connected: true, models: ['test-model', 'other-model', 'latest-model'], error: null })
+    if (path === '/api/settings' && options.method === 'PUT') {
+      savedSettings = { ...savedSettings, ...JSON.parse(options.body as string) }
+      return json(savedSettings)
+    }
     if (path === '/api/sessions' && options.method === 'POST') {
-      const created = makeSession('created', 'Created conversation')
+      const created = { ...makeSession('created', 'Created conversation'), model: savedSettings.model }
       sessions.set(created.id, created)
       return json(created)
     }
@@ -59,6 +65,18 @@ beforeEach(() => {
     if (path.startsWith('/api/files?')) return json([{ path: 'note.txt', name: 'note.txt', directory: false }])
     if (path.startsWith('/api/file?')) return json({ content: 'original' })
     if (path === '/api/file' || path.endsWith('/messages')) return json({ ok: true })
+    const modelId = path.match(/^\/api\/sessions\/([^/]+)\/model$/)?.[1]
+    if (modelId && options.method === 'PUT') {
+      const updated = { ...sessions.get(modelId)!, model: JSON.parse(options.body as string).model }
+      sessions.set(modelId, updated)
+      return json(updated)
+    }
+    const folderId = path.match(/^\/api\/sessions\/([^/]+)\/folders$/)?.[1]
+    if (folderId && options.method === 'POST') {
+      const updated = { ...sessions.get(folderId)!, allowed_directories: [JSON.parse(options.body as string).path] }
+      sessions.set(folderId, updated)
+      return json(updated)
+    }
     const id = path.match(/^\/api\/sessions\/([^/]+)$/)?.[1]
     if (id) {
       if (options.method === 'DELETE') { sessions.delete(id); return json({ ok: true }) }
@@ -130,6 +148,261 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
   const request = fetchMock.mock.calls.find(([path, options]) => path === '/api/settings' && options?.method === 'PUT')
   expect(JSON.parse(request![1]!.body as string)).toEqual({
     workspace: '/updated-project', model: 'databricks-gpt-oss-120b', env_file: '/credentials/env_vars.txt', context_window: 65536,
+  })
+})
+
+describe('conversation models', () => {
+  it('changes an idle conversation model, preserves history, and keeps other chats and defaults unchanged', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const events: Session['events'] = [{ id: 'user', type: 'user', text: 'Existing request' }, { id: 'reply', type: 'assistant', text: 'Existing answer' }]
+    sessions.set('a', { ...sessions.get('a')!, events })
+    sessions.set('b', makeSession('b', 'Second conversation'))
+    await renderApp()
+    await showSession('a')
+    const model = screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' })
+    expect(model.disabled).toBe(false)
+    fireEvent.change(model, { target: { value: 'other-model' } })
+    await waitFor(() => expect(model.value).toBe('other-model'))
+    const change = fetchMock.mock.calls.find(([path]) => path === '/api/sessions/a/model')
+    expect(change?.[1]?.method).toBe('PUT')
+    expect(JSON.parse(change![1]!.body as string)).toEqual({ model: 'other-model' })
+    expect(screen.getByText('Existing answer')).toBeTruthy()
+    expect(sessions.get('a')?.events).toEqual(events)
+    expect(savedSettings.model).toBe('test-model')
+    expect(fetchMock.mock.calls.some(([path]) => path === '/api/settings')).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: /^Second conversation/ }))
+    await showSession('b')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('test-model')
+    fireEvent.click(screen.getByRole('button', { name: /^Other conversation/ }))
+    await waitFor(() => expect(TestSocket.instances.filter(socket => socket.url.endsWith('/a/stream'))).toHaveLength(2))
+    await showSession('a')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('other-model')
+    expect(screen.getByText('Existing request')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }))
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('test-model')
+  })
+
+  it('blocks Enter and Send during model saving and merges only the returned model', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions/a/model' ? pending.promise : undefined
+    await renderApp()
+    const socket = await showSession('a')
+    const message = screen.getByRole('textbox', { name: 'Message' })
+    fireEvent.change(message, { target: { value: 'Use the selected model' } })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'other-model' } })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(true)
+    fireEvent.keyDown(message, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith('/messages'))).toBe(false)
+    act(() => socket.emit({ type: 'event', event: { id: 'streamed', type: 'assistant', text: 'New streamed answer' } }))
+    await act(async () => {
+      sessions.set('a', { ...sessions.get('a')!, model: 'other-model' })
+      pending.resolve(json({ ...sessions.get('a'), title: 'Stale title', events: [] }))
+    })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('other-model')
+    expect(screen.getByText('New streamed answer')).toBeTruthy()
+    expect(within(screen.getByRole('main')).getByText('Other conversation')).toBeTruthy()
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === '/api/sessions/a/messages')).toBe(true))
+  })
+
+  it('disables model selection while unready, busy, or submitting a message', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const bootstrap = deferred<Response>()
+    override = path => path === '/api/bootstrap' ? bootstrap.promise : undefined
+    render(<App />)
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true)
+    await act(async () => { bootstrap.resolve(json({ token: 'test-token', settings })) })
+    const socket = await socketFor('a')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true)
+    await showSession('a')
+    for (const status of ['running', 'awaiting_approval', 'compacting', 'naming', 'delegating']) {
+      act(() => socket.emit({ type: 'status', status }))
+      expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true)
+    }
+    act(() => socket.emit({ type: 'status', status: 'idle' }))
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(false)
+    const sending = deferred<Response>()
+    override = path => path.endsWith('/messages') ? sending.promise : undefined
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Send now' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true)
+    await act(async () => { sending.resolve(json({ ok: true })) })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(false)
+  })
+
+  it('keeps the previous model and releases the send lock when the server rejects a change', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    override = path => path === '/api/sessions/a/model' ? Promise.resolve(json({ detail: 'Stop the response before changing models.' }, 409)) : undefined
+    await renderApp()
+    await showSession('a')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Still ready to send' } })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'other-model' } })
+    expect((await screen.findByRole('alert')).textContent).toContain('Stop the response before changing models.')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('test-model')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(false)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(false)
+  })
+
+  it('keeps save locks scoped across navigation and ignores a late response after returning', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    sessions.set('b', makeSession('b', 'Second conversation'))
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions/a/model' ? pending.promise : undefined
+    await renderApp()
+    const oldSocket = await showSession('a')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Saved draft' } })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'other-model' } })
+    sessions.set('a', { ...sessions.get('a')!, model: 'other-model' })
+    fireEvent.click(screen.getByRole('button', { name: /^Second conversation/ }))
+    const second = await showSession('b')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(false)
+    sessions.set('b', { ...sessions.get('b')!, model: 'latest-model' })
+    act(() => {
+      second.emit({ type: 'model', model: 'latest-model' })
+      oldSocket.emit({ type: 'model', model: 'ignored-old-model' })
+    })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('latest-model')
+    fireEvent.click(screen.getByRole('button', { name: /^Other conversation/ }))
+    await waitFor(() => expect(TestSocket.instances.filter(socket => socket.url.endsWith('/a/stream'))).toHaveLength(2))
+    const current = await showSession('a')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('other-model')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(true)
+    sessions.set('a', { ...sessions.get('a')!, model: 'latest-model' })
+    act(() => current.emit({ type: 'model', model: 'latest-model' }))
+    await act(async () => { pending.resolve(json({ ...sessions.get('a'), model: 'other-model' })) })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('latest-model')
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(false)
+  })
+
+  it('does not replace a newer streamed model or status with the older model-save response', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions/a/model' ? pending.promise : undefined
+    await renderApp()
+    const socket = await showSession('a')
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'other-model' } })
+    sessions.set('a', { ...sessions.get('a')!, model: 'latest-model' })
+    act(() => {
+      socket.emit({ type: 'model', model: 'latest-model' })
+      socket.emit({ type: 'status', status: 'running' })
+      socket.emit({ type: 'event', event: { id: 'new-event', type: 'assistant', text: 'Latest model is working' } })
+    })
+    await act(async () => { pending.resolve(json({ ...sessions.get('a'), model: 'other-model', status: 'idle', events: [] })) })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('latest-model')
+    expect(screen.getByText('Latest model is working')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Stop response' })).toBeTruthy()
+  })
+
+  it('does not overwrite a newer reconnect snapshot with an older pending model response', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions/a/model' ? pending.promise : undefined
+    const { result } = renderHook(useWorkspace)
+    const socket = await showSession('a')
+    let changing!: Promise<void>
+    act(() => { changing = result.current.changeModel('other-model') })
+    sessions.set('a', { ...sessions.get('a')!, model: 'latest-model' })
+    vi.useFakeTimers()
+    act(() => socket.close())
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+    expect(TestSocket.instances).toHaveLength(2)
+    act(() => TestSocket.instances[1].emit({ type: 'snapshot', session: sessions.get('a') }))
+    expect(result.current.session?.model).toBe('latest-model')
+    await act(async () => { pending.resolve(json({ ...sessions.get('a'), model: 'other-model' })); await changing })
+    expect(result.current.session?.model).toBe('latest-model')
+    expect(result.current.sessions.find(item => item.id === 'a')?.model).toBe('latest-model')
+  })
+
+  it('changes the default model for a new draft and waits before creating its conversation', async () => {
+    const pending = deferred<Response>()
+    override = (path, options) => {
+      if (path === '/api/settings' && options.method === 'PUT') {
+        savedSettings = { ...savedSettings, ...JSON.parse(options.body as string) }
+        return pending.promise
+      }
+    }
+    await renderApp()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Use the new default' } })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'other-model' } })
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Message' }), { key: 'Enter' })
+    expect(fetchMock.mock.calls.some(([path, options]) => path === '/api/sessions' && options?.method === 'POST')).toBe(false)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(true)
+    await act(async () => { pending.resolve(json(savedSettings)) })
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('other-model')
+    const update = fetchMock.mock.calls.find(([path]) => path === '/api/settings')
+    expect(JSON.parse(update![1]!.body as string)).toEqual({ workspace: '/project', model: 'other-model', env_file: '', context_window: 32768 })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await showSession('created')
+    expect(sessions.get('created')?.model).toBe('other-model')
+    expect(fetchMock.mock.calls.some(([path]) => /\/sessions\/[^/]+\/model$/.test(String(path)))).toBe(false)
+  })
+
+  it('waits for a pending default-model save before folder access creates the first conversation', async () => {
+    const pending = deferred<Response>()
+    override = (path, options) => path === '/api/settings' && options.method === 'PUT' ? pending.promise : undefined
+    const { result } = renderHook(useWorkspace)
+    await waitFor(() => expect(result.current.ready).toBe(true))
+    let changing!: Promise<void>
+    let allowing!: Promise<void>
+    act(() => { changing = result.current.changeModel('other-model') })
+    expect(result.current.modelSaving).toBe(true)
+    await act(async () => { allowing = result.current.allowFolder('/extra') })
+    expect(fetchMock.mock.calls.some(([path, options]) => path === '/api/sessions' && options?.method === 'POST')).toBe(false)
+    expect(result.current.activeId).toBeNull()
+    await act(async () => {
+      savedSettings = { ...savedSettings, model: 'other-model' }
+      pending.resolve(json(savedSettings))
+      await Promise.all([changing, allowing])
+    })
+    await showSession('created')
+    expect(result.current.session?.model).toBe('other-model')
+    expect(result.current.session?.allowed_directories).toEqual(['/extra'])
+    expect(result.current.modelSaving).toBe(false)
+    expect(sessions.get('created')?.model).toBe('other-model')
+  })
+
+  it('changes the newly created session when folder access was already creating it, preserving the save lock', async () => {
+    const creation = deferred<Response>()
+    const modelSave = deferred<Response>()
+    override = (path, options) => {
+      if (path === '/api/sessions' && options.method === 'POST') return creation.promise
+      if (path === '/api/sessions/created/model') return modelSave.promise
+    }
+    const { result } = renderHook(useWorkspace)
+    await waitFor(() => expect(result.current.ready).toBe(true))
+    let allowing!: Promise<void>
+    let changing!: Promise<void>
+    act(() => { allowing = result.current.allowFolder('/extra') })
+    act(() => { changing = result.current.changeModel('other-model') })
+    expect(result.current.modelSaving).toBe(true)
+    expect(fetchMock.mock.calls.some(([path]) => path === '/api/settings' || path === '/api/sessions/created/model')).toBe(false)
+    await act(async () => {
+      const created = makeSession('created', 'Created conversation')
+      sessions.set(created.id, created)
+      creation.resolve(json(created))
+      await allowing
+    })
+    await showSession('created')
+    expect(result.current.activeId).toBe('created')
+    expect(result.current.modelSaving).toBe(true)
+    expect(result.current.session?.model).toBe('test-model')
+    const request = fetchMock.mock.calls.find(([path]) => path === '/api/sessions/created/model')
+    expect(JSON.parse(request![1]!.body as string)).toEqual({ model: 'other-model' })
+    await act(async () => {
+      sessions.set('created', { ...sessions.get('created')!, model: 'other-model' })
+      modelSave.resolve(json(sessions.get('created')))
+      await changing
+    })
+    expect(result.current.session?.model).toBe('other-model')
+    expect(result.current.session?.allowed_directories).toEqual(['/extra'])
+    expect(result.current.modelSaving).toBe(false)
+    expect(savedSettings.model).toBe('test-model')
+    expect(fetchMock.mock.calls.some(([path]) => path === '/api/settings')).toBe(false)
   })
 })
 

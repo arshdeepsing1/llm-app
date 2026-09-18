@@ -106,6 +106,8 @@ one-time setup step unless those dependencies change.
 Saved UI settings are in `.local/settings.json` and override `.env` defaults. Update
 the credential-file path, project folder, and model in **Settings** after migration,
 then start a new conversation. Existing conversations keep their workspace and model.
+To change the model in an existing conversation, use the dropdown below its message
+box while the conversation is idle.
 The credential URL must be the Databricks workspace root, and the selected serving
 endpoint must support streaming and function calling.
 
@@ -135,6 +137,12 @@ start a new conversation if those paths differ on the destination laptop.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+- **Model selection**: the dropdown below the message box changes the model for
+  the current conversation. Its history, title, folder access, and permissions are
+  preserved, and the next reply uses the selected endpoint with the retained chat
+  context. The selection is saved across refreshes and restarts. Choose between
+  replies; sending and model selection wait while a model change is being saved.
+  Before a conversation exists, the dropdown changes the default for new chats.
 - **Conversation titles**: the opening message supplies an immediate temporary title.
   After a successful reply, the same Databricks model creates a short heading for
   the sidebar and chat header. This uses one additional model request, billed by

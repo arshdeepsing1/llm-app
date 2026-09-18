@@ -17,7 +17,10 @@ export function useWorkspace() {
   const selected = useRef<Selection>({ ...selection })
   const draftKeys = useRef(new Map<string, string>())
   const contextUpdates = useRef(new Map<string, ContextInfo>())
+  const modelVersions = useRef(new Map<string, number>())
+  const defaultModelSave = useRef<Promise<void> | null>(null)
   const sessionsRequest = useRef(0)
+  const [modelSaves, setModelSaves] = useState<Set<string>>(() => new Set())
   const activeId = selection.id
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
@@ -121,6 +124,8 @@ export function useWorkspace() {
         if (!isCurrent()) return
         const data = JSON.parse(message.data)
         if (data.type === 'snapshot' && data.session.id === activeId) {
+          // A reconnect can reveal a model update missed while disconnected.
+          if (reconnect) modelVersions.current.set(activeId, (modelVersions.current.get(activeId) || 0) + 1)
           if (data.session.context_info) contextUpdates.current.set(activeId, data.session.context_info)
           setSession(data.session)
           void refreshSessions().catch(e => setError(e.message))
@@ -152,6 +157,12 @@ export function useWorkspace() {
           setSessions(current => current.map(item => item.id === activeId ? { ...item, title: data.title } : item))
           void refreshSessions().catch(e => setError(e.message))
         }
+        if (data.type === 'model') {
+          modelVersions.current.set(activeId, (modelVersions.current.get(activeId) || 0) + 1)
+          setSession(current => current?.id === activeId ? { ...current, model: data.model } : current)
+          setSessions(current => current.map(item => item.id === activeId ? { ...item, model: data.model } : item))
+          void refreshSessions().catch(e => setError(e.message))
+        }
       }
       socket.onclose = () => {
         if (isCurrent()) { reconnect = true; setOnline(false); timer = setTimeout(() => void connect(), 2000) }
@@ -164,6 +175,9 @@ export function useWorkspace() {
   const newConversation = () => selectSession(null)
   const ensureSession = async (target: Selection) => {
     if (!target.id) {
+      // Folder access can create a chat before its first message. Wait for a
+      // pending default-model choice before capturing the creation settings.
+      if (defaultModelSave.current) await defaultModelSave.current
       // Concurrent first actions in one draft share its creation request.
       target.creating ||= api<Session>('/sessions', 'POST', { permission_mode: draftMode })
       let created: Session
@@ -189,6 +203,34 @@ export function useWorkspace() {
     const saved = await api<Settings>('/settings', 'PUT', { workspace, model, env_file, context_window })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
+  }
+  const changeModel = async (model: string) => {
+    const target = selected.current
+    const scope = target.key
+    const creating = target.creating
+    if (modelSaves.has(scope) || (!target.id && defaultModelSave.current) || !settings) return
+    setModelSaves(current => new Set(current).add(scope))
+    try {
+      if (!target.id && !creating) {
+        const saving = saveSettings({ ...settings, model })
+        defaultModelSave.current = saving
+        try { await saving }
+        finally { if (defaultModelSave.current === saving) defaultModelSave.current = null }
+      }
+      else {
+        // A first-session request already in flight has captured its default.
+        // Change that conversation once it exists instead of changing defaults.
+        const id = target.id || (await creating!).id
+        const version = modelVersions.current.get(id)
+        const updated = await api<Session>(`/sessions/${id}/model`, 'PUT', { model })
+        if (selected.current === target && modelVersions.current.get(id) === version) {
+          modelVersions.current.set(id, (version || 0) + 1)
+          setSession(current => current?.id === id ? { ...current, model: updated.model } : current)
+          setSessions(current => current.map(item => item.id === id ? { ...item, model: updated.model } : item))
+          void refreshSessions().catch(e => setError(e.message))
+        }
+      }
+    } finally { setModelSaves(current => { const next = new Set(current); next.delete(scope); return next }) }
   }
   const deleteSession = async (id: string) => {
     await api(`/sessions/${id}`, 'DELETE')
@@ -224,6 +266,7 @@ export function useWorkspace() {
   const activeSession = session?.id === activeId ? session : null
   const reportError = (message: string) => { if (selected.current.key === selection.key) setError(message) }
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
-    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession,
+    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, changeModel,
+    modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder }
 }

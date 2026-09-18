@@ -36,9 +36,9 @@ export default function App() {
   const composer = <Composer key={app.viewKey} value={draft} setValue={setDraft} model={active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace={active?.workspace || app.settings?.workspace || ''} mode={app.permissionMode} onMode={app.setPermissionMode} onProject={() => setSettingsOpen(true)}
     onFolders={() => setFoldersOpen(true)}
-    models={app.connection?.models || []} busy={busy} hasSession={!!active}
+    models={app.connection?.models || []} busy={busy} modelSaving={app.modelSaving}
     disabled={!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
-    onModel={model => { if (app.settings) void app.saveSettings({ ...app.settings, model }).catch(e => showError(e.message)) }}
+    onModel={app.changeModel}
     onSend={app.send} onError={showError} onAttach={() => setWorkspaceOpen(true)}
     onStop={() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />
   return <div className={`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
