@@ -69,10 +69,11 @@ cp .env.example .env
 
 Edit `.env` before starting: set `LOCAL_AGENT_ENV_FILE` to the credential file's
 absolute path on this laptop, `LOCAL_AGENT_WORKSPACE` to an existing project
-folder, and `LOCAL_AGENT_MODEL` to your Databricks endpoint name. The example
-paths must be replaced. The installation command installs runtime libraries
-automatically; add `./backend[test]` instead of `./backend` only if you need to
-run the backend tests.
+folder, `LOCAL_AGENT_MODEL` to your Databricks endpoint name, and
+`LOCAL_AGENT_STATE_DIR` to the absolute folder where the app should keep its
+private state. The example paths must be replaced. The installation command
+installs runtime libraries automatically; add `./backend[test]` instead of
+`./backend` only if you need to run the backend tests.
 
 The credential file is plain assignments, parsed as data (never executed):
 
@@ -198,7 +199,11 @@ start a new conversation if those paths differ on the destination laptop.
 ### Conversation storage
 
 The default state directory is `local-agent-workspace/.local/`, overridable with
-`LOCAL_AGENT_STATE_DIR`:
+`LOCAL_AGENT_STATE_DIR` in `.env`. The directory is created at startup. Changing
+the value does not move existing data: stop the server before copying state to a
+new location, update `.env`, and then restart the app. Keep the state directory
+outside the selected project workspace when using a custom name so agent file
+tools cannot browse it.
 
 - `conversations.sqlite3`: the app's chat history. The `sessions` table has one row
   per UUID; its `data` column is JSON containing display events, the Databricks

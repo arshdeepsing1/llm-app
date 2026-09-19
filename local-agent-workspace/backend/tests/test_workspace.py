@@ -32,6 +32,22 @@ def test_env_file_is_data_not_code(tmp_path):
     assert read_env(env) == {"DBRICKS_URL": "https://workspace.example", "DBRICKS_TOKEN": "$(touch never)", "NAME": "value"}
 
 
+def test_state_directory_can_be_configured_in_dotenv(tmp_path, monkeypatch):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    state_dir = tmp_path / "private-state"
+    (app_root / ".env").write_text(f"LOCAL_AGENT_STATE_DIR={state_dir}\n")
+    monkeypatch.setattr("local_agent.config.APP_ROOT", app_root)
+
+    settings = Settings()
+
+    assert settings.state_dir == state_dir
+    assert state_dir.is_dir()
+    assert settings.path == state_dir / "settings.json"
+    with TestClient(create_app(settings)):
+        assert (state_dir / "conversations.sqlite3").is_file()
+
+
 def test_paths_prevent_escape_and_symlink_access(setup, tmp_path):
     _, _, tools = setup
     secret = tmp_path / "outside.txt"
