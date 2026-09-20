@@ -11,13 +11,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .jobs import CommandTimeout, run_process
-from .mcp_client import MCPConnection, bounded_result
+from .mcp_client import MCPConnection, bounded_error, bounded_result
 
 CONFIG_LIMIT = 32_000
 SKILL_LIMIT = 8_000
 MAX_SKILLS = 30
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,19}\Z")
 SKILL_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+TOOL_SELECTOR = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 
 def _text(value, label, limit, optional=False):
@@ -68,14 +69,21 @@ def validate_config(config):
                 else:
                     raise ValueError("MCP transport must be stdio or http.")
             else:
-                if set(entry) - {"id", "event", "command", "timeout_seconds", "enabled"}:
+                if set(entry) - {"id", "event", "command", "timeout_seconds", "enabled", "tools"}:
                     raise ValueError("Hook configuration contains unsupported fields.")
-                if entry.get("event") not in {"before_tool", "after_tool"}:
-                    raise ValueError("Hook event must be before_tool or after_tool.")
+                if entry.get("event") not in {"before_tool", "after_tool", "tool_failure"}:
+                    raise ValueError("Hook event must be before_tool, after_tool or tool_failure.")
                 timeout = entry.get("timeout_seconds", 10)
                 if type(timeout) is not int or not 1 <= timeout <= 30:
                     raise ValueError("Hook timeout must be an integer from 1 to 30 seconds.")
                 item.update(event=entry["event"], command=_text(entry.get("command"), "Hook command", 4096), timeout_seconds=timeout)
+                if "tools" in entry:
+                    selectors = entry["tools"]
+                    if (not isinstance(selectors, list) or len(selectors) > 64
+                            or any(not isinstance(name, str) or not TOOL_SELECTOR.fullmatch(name) for name in selectors)
+                            or len(set(selectors)) != len(selectors)):
+                        raise ValueError("Hook tools must be at most 64 unique exact tool names (no wildcards or regular expressions).")
+                    item["tools"] = list(selectors)
             result[key].append(item)
     if len(json.dumps(result, indent=2).encode()) > CONFIG_LIMIT:
         raise ValueError("Extension configuration exceeds 32 KB.")
@@ -133,6 +141,27 @@ class ExtensionManager:
     async def discover(self):
         async with self.turn() as connection:
             return await connection.discover()
+
+    async def test(self):
+        """Explicit diagnostics isolate each server, without enabling partial chat discovery."""
+        tokens = self._tokens()
+        redact = lambda text: self._redact(text, tokens)
+        diagnostics = {"tools": [], "servers": []}
+        for server in self.public_config()["servers"]:
+            item = {"id": server["id"], "name": redact(server["name"]), "status": "disabled", "tools": []}
+            diagnostics["servers"].append(item)
+            if not server["enabled"]:
+                continue
+            try:
+                # Enter and close on this task even when initialization fails.
+                async with MCPConnection([server], redact) as connection:
+                    definitions = await connection.discover()
+                    names = [redact(tool["function"]["name"]) for tool in definitions]
+                item.update(status="connected", tools=names)
+                diagnostics["tools"].extend(names)
+            except Exception as error:
+                item.update(status="failed", error=bounded_error(redact(str(error))))
+        return diagnostics
 
     async def call(self, name, arguments):
         async with self.turn() as connection:

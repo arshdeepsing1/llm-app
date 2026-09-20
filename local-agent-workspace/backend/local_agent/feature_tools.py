@@ -19,7 +19,8 @@ FEATURE_TOOLS = [
                {"task_id": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]},
                 "title": {"type": "string"}, "description": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}}}, ["task_id"]),
-    definition("delegate_task", "Run one bounded subagent in a separate conversation using the same workspace and permissions. Pass needed context explicitly. Waits for the result; cannot recurse or leave background jobs.",
+    definition("delegate_task", "Run one bounded subagent in a separate conversation using the same workspace and permissions. Pass needed context explicitly. Optional tool_profile narrows capabilities: read_only (file inspection), file_editor (inspection and file edits, no commands/MCP/hooks), inherit (parent's selected ceiling). Cannot widen the parent's subagent tool profile. Waits for the result; cannot recurse or leave background jobs.",
                {"task": {"type": "string"}, "context": {"type": "string"},
+                "tool_profile": {"type": "string", "enum": ["inherit", "read_only", "file_editor"]},
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 8}}, ["task"]),
 ]

@@ -50,7 +50,7 @@ async def test_external_csv_listing_requires_access_and_remembers_grant(setup, t
         assert 'declined' in result
         assert session['allowed_directories'] == []
         return
-    assert [row['name'] for row in json.loads(result)] == ['report.CSV']
+    assert [row['name'] for row in json.loads(result)['entries']] == ['report.CSV']
     saved = store.get(session['id'])
     assert saved['allowed_directories'] == [str(downloads)]
     restored_tools = WorkspaceTools(str(tools.root), allowed_directories=saved['allowed_directories'])
@@ -99,7 +99,7 @@ async def test_plan_blocks_writes_and_commands(setup):
         assert 'read-only' in result
     assert not (tools.root / 'blocked.txt').exists()
     assert not manager.pending
-    assert json.loads(await manager.execute_tool(session, tools, 'list_files', {}, 'read')) == []
+    assert json.loads(await manager.execute_tool(session, tools, 'list_files', {}, 'read'))['entries'] == []
 
 
 @pytest.mark.parametrize('command', ['pwd; touch changed', 'ls > changed', 'ls $(touch changed)', 'python -c "print(1)"', 'ls ../private', 'ls\ntouch changed'])

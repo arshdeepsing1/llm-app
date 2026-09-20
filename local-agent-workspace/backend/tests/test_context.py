@@ -7,12 +7,13 @@ import pytest
 from local_agent.context import (
     DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, REPLY_RESERVE,
     SAFETY_MARGIN, SUMMARY_MAX_BYTES, SUMMARY_PREFIX, build_summary_messages,
-    context_messages, estimate_tokens, prepare_context,
+    context_breakdown, context_messages, estimate_tokens, prepare_context,
 )
 
 
 SYSTEM = {"role": "system", "content": "Follow the user's current request."}
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+COMPACTION_CONTEXT_WINDOW = 32768
 
 
 def user(text):
@@ -24,7 +25,7 @@ def assistant(text):
 
 
 def long_history():
-    return [user("old " * 7500), assistant("Old work done."),
+    return [user("old " * 22500), assistant("Old work done."),
             user("Previous request"), assistant("Previous answer"), user("Latest request")]
 
 
@@ -32,11 +33,48 @@ async def forbidden_summary(previous, chunk):
     pytest.fail("Summarization should not run")
 
 
-def test_estimate_counts_utf8_serialized_request_and_overhead():
+def test_estimate_counts_unicode_escaping_tool_definitions_and_overhead():
     messages = [SYSTEM, user('Unicode: 汉字🙂 and escapes: \\"\n')]
-    expected = len(json.dumps({"messages": messages, "tools": TOOLS}, ensure_ascii=False).encode("utf-8")) + 256
-    assert estimate_tokens(messages, TOOLS) == expected
+    assert estimate_tokens(messages, TOOLS) > estimate_tokens(messages)
+    assert estimate_tokens(messages, TOOLS) > estimate_tokens([SYSTEM, user("Unicode")], TOOLS)
     assert estimate_tokens([user("🙂")]) > estimate_tokens([user("x")])
+
+
+def test_estimate_uses_token_scale_for_ascii_and_conservative_unicode_weighting():
+    ascii_estimate = estimate_tokens([SYSTEM, user("File contents. " * 7000)], TOOLS)
+    assert 30000 < ascii_estimate < 40000
+    assert estimate_tokens([user("🙂" * 1000)]) > estimate_tokens([user("x" * 1000)]) * 4
+
+
+@pytest.mark.parametrize("text", ["", "plain text", '汉字🙂\\"\n' * 50])
+@pytest.mark.parametrize("has_summary", [False, True])
+def test_context_breakdown_accounts_for_same_estimate(text, has_summary):
+    messages = [SYSTEM, *([user(SUMMARY_PREFIX + text)] if has_summary else []), user(text),
+                {"role": "tool", "tool_call_id": "read-1", "content": text}]
+    original = copy.deepcopy(messages)
+    breakdown = context_breakdown(messages, TOOLS, has_summary)
+    assert sum(breakdown.values()) == estimate_tokens(messages, TOOLS)
+    assert all(type(value) is int and value >= 0 for value in breakdown.values())
+    assert breakdown["system_instructions"] > 0
+    assert breakdown["tool_definitions"] > 0
+    assert breakdown["messages_and_results"] > 0
+    assert breakdown["request_overhead"] >= 256
+    assert (breakdown["summary"] > 0) == has_summary
+    assert messages == original
+
+
+def test_empty_context_categories_are_zero_not_phantom_tokens():
+    breakdown = context_breakdown([SYSTEM], [])
+    assert breakdown["tool_definitions"] == breakdown["summary"] == breakdown["messages_and_results"] == 0
+    assert sum(breakdown.values()) == estimate_tokens([SYSTEM], [])
+
+
+async def test_large_ascii_request_fits_131000_context_without_premature_compaction():
+    wire = [user("Read these files: " + "path/to/file.py\n" * 7000)]
+    messages, state, info = await prepare_context(wire, None, SYSTEM, TOOLS, 131000, forbidden_summary)
+    assert messages == [SYSTEM, *wire]
+    assert state["compactions"] == 0
+    assert info["estimated_tokens"] < info["input_budget"] * 0.4
 
 
 def test_context_messages_adds_historical_summary_without_changing_archive():
@@ -56,7 +94,8 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
     assert info == {"estimated_tokens": estimate_tokens(messages, TOOLS),
                     "input_budget": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
                     "context_window": DEFAULT_CONTEXT_WINDOW, "reply_reserve": REPLY_RESERVE,
-                    "compactions": 0, "summarized_messages": 0, "estimate_method": "conservative_utf8"}
+                    "compactions": 0, "summarized_messages": 0, "estimate_method": "weighted_utf8",
+                    "breakdown": context_breakdown(messages, TOOLS)}
 
 
 async def test_compaction_keeps_latest_two_turns_and_complete_tool_exchanges():
@@ -77,42 +116,45 @@ async def test_compaction_keeps_latest_two_turns_and_complete_tool_exchanges():
         chunks.append(chunk)
         return "The earlier work is complete."
 
-    messages, updated, info = await prepare_context(wire, state, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+    messages, updated, info = await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     assert updated["through"] == 2
     assert updated["compactions"] == 1
     assert messages[2:] == wire[2:]
     assert "".join(chunks) == json.dumps(wire[:2], ensure_ascii=False)
     assert info["summarized_messages"] == 2
     assert info["estimated_tokens"] <= info["input_budget"]
+    assert info["breakdown"] == context_breakdown(messages, TOOLS, has_summary=True)
+    assert info["breakdown"]["summary"] > 0
+    assert sum(info["breakdown"].values()) == info["estimated_tokens"]
     assert (wire, state) == original
 
 
 async def test_compaction_falls_back_to_latest_turn_when_two_do_not_fit():
     wire = long_history()
-    wire[2] = user("p" * 20000)
+    wire[2] = user("p" * 70000)
 
     async def summarize(previous, chunk):
         return "Earlier requests summarized."
 
-    messages, state, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+    messages, state, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     assert state["through"] == 4
     assert messages[2:] == wire[4:]
 
 
 @pytest.mark.parametrize("large_system", [False, True])
 async def test_no_summary_call_when_latest_turn_or_system_cannot_fit(large_system):
-    wire = [user("old"), assistant("answer"), user("x" * (10 if large_system else 30000))]
-    system = {"role": "system", "content": "s" * (30000 if large_system else 10)}
+    wire = [user("old"), assistant("answer"), user("x" * (10 if large_system else 90000))]
+    system = {"role": "system", "content": "s" * (90000 if large_system else 10)}
     state = {"summary": "", "through": 0, "compactions": 0}
     original = copy.deepcopy((wire, state))
     with pytest.raises(ValueError, match="Increase the context window"):
-        await prepare_context(wire, state, system, TOOLS, DEFAULT_CONTEXT_WINDOW, forbidden_summary)
+        await prepare_context(wire, state, system, TOOLS, COMPACTION_CONTEXT_WINDOW, forbidden_summary)
     assert (wire, state) == original
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("provider failed"), asyncio.CancelledError()])
 async def test_failure_after_first_chunk_never_commits_partial_summary(failure):
-    wire = [user("already archived"), assistant("done"), user("x" * 60000), assistant("done"),
+    wire = [user("already archived"), assistant("done"), user("x" * 180000), assistant("done"),
             user("recent"), assistant("answer"), user("latest")]
     state = {"summary": "Prior summary", "through": 2, "compactions": 3}
     original = copy.deepcopy((wire, state))
@@ -127,7 +169,7 @@ async def test_failure_after_first_chunk_never_commits_partial_summary(failure):
 
     expected = asyncio.CancelledError if isinstance(failure, asyncio.CancelledError) else ValueError
     with pytest.raises(expected):
-        await prepare_context(wire, state, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+        await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     assert calls == 2
     assert (wire, state) == original
 
@@ -141,7 +183,7 @@ async def test_summary_must_be_nonempty_text_within_byte_limit(summary):
         return summary
 
     with pytest.raises(ValueError, match="summary"):
-        await prepare_context(wire, state, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+        await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     assert (wire, state) == original
 
 
@@ -172,11 +214,11 @@ async def test_repeated_compaction_only_summarizes_newly_archived_messages():
         requests.append((previous, chunk))
         return "All earlier work summarized."
 
-    _, first, _ = await prepare_context(wire, None, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+    _, first, _ = await prepare_context(wire, None, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     requests.clear()
-    wire.extend([assistant("last answer"), user("new " * 7000), assistant("done"), user("Final request")])
+    wire.extend([assistant("last answer"), user("new " * 21000), assistant("done"), user("Final request")])
     original = copy.deepcopy((wire, first))
-    messages, second, info = await prepare_context(wire, first, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+    messages, second, info = await prepare_context(wire, first, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     assert first["through"] == 2
     assert second["through"] == 8
     assert second["compactions"] == 2
@@ -189,7 +231,7 @@ async def test_repeated_compaction_only_summarizes_newly_archived_messages():
 
 async def test_final_serialized_request_is_checked_before_committing_summary():
     wire = long_history()
-    wire[2] = user("x" * 18000)
+    wire[2] = user("x" * 60000)
     state = {}
     original = copy.deepcopy((wire, state))
 
@@ -197,7 +239,7 @@ async def test_final_serialized_request_is_checked_before_committing_summary():
         return "\\" * SUMMARY_MAX_BYTES
 
     with pytest.raises(ValueError, match="still exceed the context budget"):
-        await prepare_context(wire, state, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, summarize)
+        await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
     assert (wire, state) == original
 
 

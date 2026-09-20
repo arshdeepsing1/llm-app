@@ -121,6 +121,22 @@ class WorkspaceTools:
         visit(base, min(max(depth, 1), 3))
         return result
 
+    def list_files_page(self, path=".", depth=1, glob="*", offset=0):
+        _integer(offset, "offset", 0, 300)
+        entries = self.list_files(path, depth, glob)
+        result = {"entries": [], "next_offset": None, "truncated": False,
+                  "listing_limit_reached": len(entries) == 300}
+        for entry in entries[offset:]:
+            candidate = {**result, "entries": [*result["entries"], entry],
+                         "next_offset": None, "truncated": False}
+            if _output_size(candidate) > QUERY_OUTPUT_LIMIT:
+                if not result["entries"]:
+                    raise ValueError("A file entry exceeds the 8 KB listing limit; choose a shorter path.")
+                result.update(next_offset=offset + len(result["entries"]), truncated=True)
+                break
+            result["entries"].append(entry)
+        return result
+
     def read_file(self, path: str):
         target = self.path(path)
         if target.stat().st_size > LIMIT:
@@ -316,7 +332,8 @@ class WorkspaceTools:
         if name in ("write_file", "edit_file"):
             return self.change(name, arguments, apply=True)
         if name == "list_files":
-            return self.list_files(arguments.get("path", "."), arguments.get("depth", 1), arguments.get("glob", "*"))
+            return self.list_files_page(arguments.get("path", "."), arguments.get("depth", 1),
+                                        arguments.get("glob", "*"), arguments.get("offset", 0))
         if name == "read_file":
             return await asyncio.to_thread(self.read_file_range, arguments["path"],
                                            arguments.get("start_line", 1), arguments.get("max_lines", 200))
@@ -328,13 +345,14 @@ class WorkspaceTools:
 
 def definition(name, description, properties, required):
     return {"type": "function", "function": {"name": name, "description": description,
-            "parameters": {"type": "object", "properties": properties, "required": required}}}
+            "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}}}
 
 
 STRING = {"type": "string"}
 TOOL_DEFINITIONS = [
-    definition("list_files", "List local files using an absolute, home-relative or workspace-relative path. The app requests access for external folders. Optional glob filters names (e.g. *.csv). Maximum 300 entries; refine the glob if the limit is reached. Excludes secrets and generated folders.",
-               {"path": STRING, "depth": {"type": "integer"}, "glob": STRING}, []),
+    definition("list_files", "List local files using an absolute, home-relative or workspace-relative path. The app requests access for external folders. Optional glob filters names (e.g. *.csv). Returns entries and next_offset in pages of at most 8 KB; follow next_offset with the same path, depth and glob. If listing_limit_reached is true, narrow the folder or glob to find entries beyond the first 300. Excludes secrets and generated folders.",
+               {"path": STRING, "depth": {"type": "integer"}, "glob": STRING,
+                "offset": {"type": "integer", "minimum": 0, "maximum": 300}}, []),
     definition("read_file", "Read numbered lines from a regular UTF-8 file. Defaults to 200 lines; output is at most 8 KB. Follow next_line for more. Scanning is limited to 8 MB and individual lines to 128 KB. External paths trigger folder access approval.",
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 1000}}, ["path"]),

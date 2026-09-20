@@ -18,7 +18,7 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
     (state / "settings.json").write_text(json.dumps({**editable, **obsolete}))
     settings = Settings(state)
     settings.credentials = lambda: ("https://gateway.example", "fake-token")
-    expected = {**editable, "context_window": 32768}
+    expected = {**editable, "context_window": 131000}
     assert settings.values == expected
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()

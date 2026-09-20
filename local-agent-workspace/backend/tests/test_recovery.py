@@ -247,3 +247,73 @@ def test_delete_session_api_removes_checkpoint_rows(tmp_path, monkeypatch):
         assert client.delete(f"/api/sessions/{session_id}", headers=headers).status_code == 200
         assert manager.store.db.execute("SELECT COUNT(*) FROM checkpoints WHERE session_id=?", (session_id,)).fetchone()[0] == 0
         assert (tmp_path / "file").read_text() == "edited"
+
+
+def test_turn_preview_groups_edits_but_preserves_individual_drift_checks(recovery):
+    manager, tools, store = recovery
+    for path in ("first.py", "second.py"):
+        (tools.root / path).write_text("before")
+        manager.apply_edit(tools, "write_file", {"path": path, "content": "after"}, "session", turn_id="turn-1")
+    manager.apply_edit(tools, "write_file", {"path": "other.py", "content": "other turn"}, "session", turn_id="turn-2")
+    manager.apply_edit(tools, "write_file", {"path": "manual.py", "content": "manual edit"}, "session")
+    (tools.root / "second.py").write_text("external change")
+    restarted = CheckpointManager(store)
+    group = restarted.preview_turn("turn-1", tools, "session")
+    previews = {item["path"]: item for item in group["previews"]}
+    assert set(previews) == {"first.py", "second.py"}
+    assert group["next_offset"] is None
+    assert previews["first.py"]["can_restore"] is True
+    assert previews["second.py"]["can_restore"] is False
+    assert "external change" in previews["second.py"]["diff"]
+    assert (tools.root / "first.py").read_text() == "after", "Preview never writes files."
+    with pytest.raises(ValueError, match="No checkpoints"):
+        restarted.preview_turn("turn-1", tools, "unrelated-session")
+    with pytest.raises(ValueError, match="No checkpoints"):
+        restarted.preview_turn("turn-1", WorkspaceTools(str(tools.root.parent)), "session")
+    legacy = next(item for item in restarted.list() if item["path"] == "manual.py")
+    assert legacy["turn_id"] is None
+    restored = restarted.restore(previews["first.py"]["id"], tools, previews["first.py"]["expected_current_hash"], "session")
+    assert restarted._metadata(restarted._get(restored["reverse_checkpoint_id"], tools, "session")[0])["turn_id"] is None
+
+
+def test_turn_preview_is_bounded_and_revoked_access_does_not_reveal_diff(recovery, tmp_path):
+    manager, tools, _ = recovery
+    for index in range(11):
+        manager.apply_edit(tools, "write_file", {"path": f"file{index}", "content": "new"}, "session", turn_id="turn")
+    page = manager.preview_turn("turn", tools, "session")
+    assert len(page["previews"]) == 10 and page["next_offset"] == 10
+    last = manager.preview_turn("turn", tools, "session", page["next_offset"])
+    assert len(last["previews"]) == 1 and last["next_offset"] is None
+    assert len({item["id"] for item in page["previews"] + last["previews"]}) == 11
+    for offset in (-1, 11, True):
+        with pytest.raises(ValueError, match="offset"):
+            manager.preview_turn("turn", tools, "session", offset)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "file"
+    target.write_text("original private content")
+    granted = WorkspaceTools(str(tools.root), allowed_directories=[str(outside)])
+    manager.apply_edit(granted, "write_file", {"path": str(target), "content": "updated private content"}, "session", turn_id="external")
+    preview = manager.preview_turn("external", tools, "session")["previews"][0]
+    assert preview["can_restore"] is False and preview["diff"] == ""
+    assert "private content" not in json.dumps(preview)
+
+
+def test_turn_preview_api_requires_scoped_session_and_does_not_mutate(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    settings = Settings(tmp_path / "state")
+    settings.env = {}
+    settings.values.update(workspace=str(tmp_path), env_file="")
+    app = create_app(settings)
+    manager = app.state.manager
+    with TestClient(app) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        session_id = client.post("/api/sessions", headers=headers).json()["id"]
+        other_id = client.post("/api/sessions", headers=headers).json()["id"]
+        manager.checkpoints.apply_edit(WorkspaceTools(str(tmp_path)), "write_file", {"path": "file", "content": "new"}, session_id, turn_id="turn")
+        response = client.get(f"/api/checkpoint-turns/turn/preview?session_id={session_id}", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["previews"][0]["can_restore"] is True
+        assert client.get(f"/api/checkpoint-turns/turn/preview?session_id={other_id}", headers=headers).status_code == 400
+        assert client.get("/api/checkpoint-turns/turn/preview", headers=headers).status_code == 422
+        assert (tmp_path / "file").read_text() == "new"

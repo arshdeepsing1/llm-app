@@ -31,6 +31,9 @@ server = MCPServer("Local test", log_level="ERROR")
 def echo(text: str) -> str:
     return text + " env=" + str(os.environ.get("DBRICKS_TOKEN"))
 @server.tool()
+def fail() -> str:
+    raise ValueError("Intentional test failure")
+@server.tool()
 async def slow() -> str:
     Path(sys.argv[2]).write_text("started")
     await asyncio.sleep(30)
@@ -132,8 +135,50 @@ async def test_tool_result_error_is_retained(extension_manager, local_server):
     extension_manager.update_config({"servers": [local_server]})
     async with extension_manager.turn() as connection:
         await connection.discover()
-        result = await connection.call("mcp__local__echo", {})
+        result = await connection.call("mcp__local__fail", {})
         assert result["is_error"] is True
+
+
+async def test_invalid_tool_arguments_are_rejected_locally(extension_manager, local_server):
+    extension_manager.update_config({"servers": [local_server]})
+    async with extension_manager.turn() as connection:
+        await connection.discover()
+        with pytest.raises(ValueError, match="required constraint"):
+            await connection.call("mcp__local__echo", {})
+        assert (await connection.call("mcp__local__echo", {"text": "valid"}))["is_error"] is False
+
+
+async def test_diagnostics_check_every_server_and_redact_failures(extension_manager, local_server, tmp_path):
+    extension_manager.settings.redact = lambda text: text.replace("secret-token", "[REDACTED]")
+    bad = {**local_server, "id": "broken", "command": "/missing/secret-token"}
+    disabled = {**bad, "id": "disabled", "enabled": False}
+    last = {**bad, "id": "last"}
+    extension_manager.update_config({"servers": [bad, local_server, disabled, last]})
+    report = await extension_manager.test()
+    assert [item["status"] for item in report["servers"]] == ["failed", "connected", "disabled", "failed"]
+    assert report["servers"][1]["tools"] == report["tools"]
+    assert "mcp__local__echo" in report["tools"]
+    assert report["servers"][2]["tools"] == [] and "error" not in report["servers"][2]
+    assert "secret-token" not in json.dumps(report)
+    assert "[REDACTED]" in json.dumps(report)
+    assert not process_exists(int((tmp_path / "server.pid").read_text()))
+
+
+async def test_failed_or_closed_discovery_never_reuses_partial_tools(extension_manager, local_server, tmp_path):
+    bad = {**local_server, "id": "broken", "command": "/does/not/exist"}
+    extension_manager.update_config({"servers": [local_server, bad]})
+    async with extension_manager.turn() as connection:
+        with pytest.raises(ValueError, match="MCP server broken"):
+            await connection.discover()
+        assert connection.registry == {} and connection.definitions == [] and connection.tool_names == set()
+        with pytest.raises(ValueError, match="no longer available"):
+            await connection.call("mcp__local__echo", {"text": "must not run"})
+        with pytest.raises(ValueError, match="start a new turn"):
+            await connection.discover()
+    assert not process_exists(int((tmp_path / "server.pid").read_text()))
+    assert connection.tool_names == set()
+    with pytest.raises(ValueError, match="no longer available"):
+        await connection.call("mcp__local__echo", {"text": "must not run"})
 
 
 def test_model_names_are_bounded_and_unambiguous_after_sanitizing():

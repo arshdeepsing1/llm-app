@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import AgentToolsDialog from '../src/components/AgentToolsDialog'
 import type { Session } from '../src/types'
@@ -38,6 +38,7 @@ beforeEach(() => {
     if (path.endsWith('/tasks')) return json(options.method === 'POST' ? { ...task, id: 'new-task', ...JSON.parse(options.body as string) } : [task])
     if (path.includes('/tasks/')) return json({ ...task, ...JSON.parse(options.body as string) })
     if (path.endsWith('/children')) return json([{ ...session('child'), title: 'Child review', status: 'awaiting_approval' }])
+    if (path.endsWith('/subagent-profile')) return json({ ...session(), subagent_tool_profile: JSON.parse(options.body as string).tool_profile })
     if (path === '/api/extensions') return json(options.method === 'PUT' ? JSON.parse(options.body as string) : config)
     if (path === '/api/extensions/test') return json({ tools: ['example.search'] })
     if (path === '/api/skills' || path.startsWith('/api/skills?')) return json([skill])
@@ -78,6 +79,56 @@ it('keeps an unrestorable checkpoint disabled and displays the server explanatio
   expect((await screen.findByRole<HTMLButtonElement>('button', { name: 'Restore checkpoint' })).disabled).toBe(true)
   expect(screen.getByRole('alert').textContent).toBe('The file changed externally.')
   expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/restore'))).toBe(false)
+})
+
+it('previews a user turn together but restores only the explicitly selected file', async () => {
+  const second = { ...checkpoint, id: 'second', path: 'src/helper.py', turn_id: 'turn-1' }
+  const first = { ...checkpoint, turn_id: 'turn-1' }
+  const selected = session()
+  selected.events = [{ id: 'turn-1', type: 'user', text: 'Update both parsers' }]
+  override = path => {
+    if (path === '/api/checkpoints?session_id=a') return Promise.resolve(json([first, second]))
+    if (path === '/api/checkpoint-turns/turn-1/preview?session_id=a&offset=0') return Promise.resolve(json({ turn_id: 'turn-1', next_offset: null, previews: [
+      { ...first, diff: '-new\n+old', expected_current_hash: 'first-hash', can_restore: true },
+      { ...second, diff: '', expected_current_hash: 'second-hash', can_restore: false, error: 'Changed externally.' },
+    ] }))
+    return undefined
+  }
+  render(dialog(selected))
+  fireEvent.click(await screen.findByRole('button', { name: 'Preview turn turn-1' }))
+  expect(screen.getByText('Update both parsers')).toBeTruthy()
+  const firstPreview = await screen.findByRole('group', { name: 'Recovery preview src/main.py' })
+  const secondPreview = screen.getByRole('group', { name: 'Recovery preview src/helper.py' })
+  expect(within(secondPreview).getByRole<HTMLButtonElement>('button', { name: 'Restore checkpoint' }).disabled).toBe(true)
+  expect(screen.getByText(/not a whole-turn undo/)).toBeTruthy()
+  fireEvent.click(within(firstPreview).getByRole('button', { name: 'Restore checkpoint' }))
+  await screen.findByText('Restored src/main.py.')
+  const restores = fetchMock.mock.calls.filter(([path]) => String(path).includes('/restore'))
+  expect(restores).toHaveLength(1)
+  expect(restores[0][0]).toBe('/api/checkpoints/checkpoint/restore?session_id=a')
+  expect(JSON.parse(restores[0][1]!.body as string)).toEqual({ expected_current_hash: 'first-hash' })
+})
+
+it('loads bounded turn preview pages and clears them on session switch', async () => {
+  override = path => {
+    if (path === '/api/checkpoints?session_id=a') return Promise.resolve(json([{ ...checkpoint, turn_id: 'turn-1' }]))
+    if (path.startsWith('/api/checkpoint-turns/turn-1/preview?session_id=a')) {
+      const offset = new URL(path, 'http://localhost').searchParams.get('offset')
+      return Promise.resolve(json({ turn_id: 'turn-1', next_offset: offset === '0' ? 10 : null, previews: [
+        { ...checkpoint, id: `page-${offset}`, path: `page-${offset}.py`, diff: 'diff', expected_current_hash: 'hash', can_restore: true },
+      ] }))
+    }
+    return undefined
+  }
+  const view = render(dialog())
+  fireEvent.click(await screen.findByRole('button', { name: 'Preview turn turn-1' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'More checkpoints in this turn' }))
+  await screen.findByRole('group', { name: 'Recovery preview page-10.py' })
+  expect(screen.getByRole('group', { name: 'Recovery preview page-0.py' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'More checkpoints in this turn' })).toBeNull()
+  view.rerender(dialog(session('b')))
+  await screen.findByRole('button', { name: 'Preview checkpoint src/main.py' })
+  expect(screen.queryByRole('group', { name: /Recovery preview/ })).toBeNull()
 })
 
 it('creates scoped worktrees from explicit branches and opens their conversations', async () => {
@@ -249,4 +300,42 @@ it('does not navigate when an open-worktree request finishes after closing the d
   view.unmount()
   await act(async () => { pending.resolve(json(session('late-session'))) })
   expect(onSelectSession).not.toHaveBeenCalled()
+})
+
+it('saves a new subagent ceiling only after the server accepts it', async () => {
+  await openTab('Tasks')
+  await screen.findByRole('button', { name: 'Open subagent Child review' })
+  const selector = screen.getByRole<HTMLSelectElement>('combobox', { name: 'New subagent tool ceiling' })
+  fireEvent.change(selector, { target: { value: 'read_only' } })
+  await screen.findByText('Tool ceiling saved for new subagents.')
+  expect(selector.value).toBe('read_only')
+  const call = fetchMock.mock.calls.find(([path]) => path === '/api/sessions/a/subagent-profile')
+  expect(JSON.parse(call![1]!.body as string)).toEqual({ tool_profile: 'read_only' })
+  override = path => path.endsWith('/subagent-profile') ? Promise.resolve(json({ detail: 'Conversation is running.' }, 409)) : undefined
+  fireEvent.change(selector, { target: { value: 'inherit' } })
+  await screen.findByRole('alert')
+  expect(selector.value).toBe('read_only')
+})
+
+it('does not offer profile widening for a child conversation', async () => {
+  await openTab('Tasks', { ...session(), is_subagent: true, tool_profile: 'read_only' })
+  expect(screen.queryByRole('combobox', { name: 'New subagent tool ceiling' })).toBeNull()
+  expect(screen.getByText(/This child cannot widen/)).toBeTruthy()
+})
+
+it('shows independent healthy, failed and disabled MCP results and clears stale results', async () => {
+  override = path => path === '/api/extensions/test' ? Promise.resolve(json({ tools: ['mcp__ok__search'], servers: [
+    { id: 'ok', name: 'Search server', status: 'connected', tools: ['mcp__ok__search'] },
+    { id: 'bad', name: 'Broken server', status: 'failed', tools: [], error: 'Connection refused' },
+    { id: 'off', name: 'Unused server', status: 'disabled', tools: [] },
+  ] })) : undefined
+  await openTab('Extensions')
+  await screen.findByText('Review code')
+  fireEvent.click(screen.getByRole('button', { name: 'Test saved configuration' }))
+  await screen.findByText('Connection refused')
+  expect(screen.getByText('Connected during test · 1 tools')).toBeTruthy()
+  expect(screen.getByText('Disabled · not started')).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'Save configuration' }))
+  await screen.findByText('Configuration saved.')
+  expect(screen.queryByText('Connection refused')).toBeNull()
 })

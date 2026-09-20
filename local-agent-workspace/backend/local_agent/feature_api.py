@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from .agents import public_session
+from .tool_profiles import validate_profile
 
 
 class RestoreRequest(BaseModel):
@@ -25,6 +26,10 @@ class SkillRequest(BaseModel):
     enabled: bool = True
 
 
+class SubagentProfileRequest(BaseModel):
+    tool_profile: str = Field(strict=True, max_length=32)
+
+
 def register_features(app, manager, settings, store, session_or_404, workspace_tools):
     def idle(session):
         if manager.statuses.get(session["id"], "idle") != "idle":
@@ -44,6 +49,15 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     @app.get("/api/checkpoints/{checkpoint_id}/preview")
     async def preview(checkpoint_id: str, session_id: str | None = None):
         return manager.checkpoints.preview(checkpoint_id, workspace_tools(session_id), session_id=session_id)
+
+    @app.get("/api/checkpoint-turns/{turn_id}/preview")
+    async def preview_turn(turn_id: str, session_id: str, offset: int = 0):
+        session_or_404(session_id)
+        result = manager.checkpoints.preview_turn(turn_id, workspace_tools(session_id), session_id, offset)
+        for preview in result["previews"]:
+            if "error" in preview:
+                preview["error"] = settings.redact(preview["error"])
+        return result
 
     @app.post("/api/checkpoints/{checkpoint_id}/restore")
     async def restore(checkpoint_id: str, body: RestoreRequest, session_id: str | None = None):
@@ -106,6 +120,18 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         return [{**child, "status": manager.statuses.get(child["id"], "idle")}
                 for child in manager.delegates.children(session_id)]
 
+    @app.put("/api/sessions/{session_id}/subagent-profile")
+    async def subagent_profile(session_id: str, body: SubagentProfileRequest):
+        session = session_or_404(session_id)
+        idle(session)
+        if session.get("is_subagent"):
+            raise HTTPException(400, "Subagents cannot delegate or change their inherited tool profile.")
+        session["subagent_tool_profile"] = validate_profile(body.tool_profile)
+        store.save(session)
+        result = public_session(session)
+        await manager.broadcast(session_id, {"type": "snapshot", "session": result})
+        return result
+
     def extensions_idle():
         if any(not task.done() for task in manager.tasks.values()):
             raise HTTPException(409, "Stop active responses before changing or testing extensions.")
@@ -122,8 +148,7 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     @app.post("/api/extensions/test")
     async def test_extensions():
         extensions_idle()
-        tools = await manager.extensions.discover()
-        return {"tools": [tool["function"]["name"] for tool in tools]}
+        return await manager.extensions.test()
 
     @app.get("/api/skills")
     async def skills(session_id: str | None = None):

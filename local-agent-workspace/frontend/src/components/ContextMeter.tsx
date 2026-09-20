@@ -1,24 +1,64 @@
+import { useState } from 'react'
 import type { ContextInfo } from '../types'
 
-export default function ContextMeter({ info }: { info?: ContextInfo }) {
+export default function ContextMeter({ info, busy = false, onCompact }: {
+  info?: ContextInfo; busy?: boolean; onCompact?: (preservationNote: string) => Promise<void>;
+}) {
+  const [note, setNote] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
   if (!info) return <p className="context-empty">Context usage is estimated after the first turn.</p>
+  const legacyEstimate = info.estimate_method === 'conservative_utf8'
   const percent = Math.round(info.estimated_tokens / info.input_budget * 100)
   const safetyReserve = info.context_window - info.input_budget - info.reply_reserve
   return <details className="context-meter">
     <summary>
-      <span>Last model input · ~{percent}%</span>
-      <progress aria-label="Estimated model input usage" aria-valuetext={`Approximately ${percent}% of input budget`} value={Math.min(percent, 100)} max={100} />
+      <span>{info.prepared_for_next_turn ? 'Context preview' : 'Last model input'} · {legacyEstimate ? 'estimate outdated' : `~${percent}%`}</span>
+      {!legacyEstimate ? <progress aria-label="Estimated model input usage" aria-valuetext={`Approximately ${percent}% of input budget`} value={Math.min(percent, 100)} max={100} /> : null}
       {info.compactions > 0 ? <span> · {info.compactions} {info.compactions === 1 ? 'compaction' : 'compactions'}</span> : null}
       {info.warnings.length > 0 ? <span> · {info.warnings.length} {info.warnings.length === 1 ? 'warning' : 'warnings'}</span> : null}
     </summary>
     <div className="context-details">
-      <p>Approximately {info.estimated_tokens.toLocaleString()} of {info.input_budget.toLocaleString()} input tokens used.</p>
-      <p>Conservative UTF-8 estimate, not a provider token count. Estimate for the last request; updates each model call.</p>
+      {legacyEstimate ? <p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p> : <>
+        <p>Approximately {info.estimated_tokens.toLocaleString()} of {info.input_budget.toLocaleString()} input tokens used.</p>
+        <p>Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model. {info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
+      </>}
+      {!legacyEstimate && info.breakdown ? <>
+        <p className="context-heading">Approximate input breakdown</p>
+        <dl className="context-breakdown">
+          <div><dt>System instructions</dt><dd>~{info.breakdown.system_instructions.toLocaleString()} tokens</dd></div>
+          <div><dt>Tool definitions</dt><dd>~{info.breakdown.tool_definitions.toLocaleString()} tokens</dd></div>
+          <div><dt>Messages and tool results</dt><dd>~{info.breakdown.messages_and_results.toLocaleString()} tokens</dd></div>
+          <div><dt>Conversation summary</dt><dd>~{info.breakdown.summary.toLocaleString()} tokens</dd></div>
+          <div><dt>Request overhead</dt><dd>~{info.breakdown.request_overhead.toLocaleString()} tokens</dd></div>
+        </dl>
+      </> : null}
+      <p>Automatic compaction threshold: approximately {info.input_budget.toLocaleString()} input tokens.</p>
       <p>Of the {info.context_window.toLocaleString()}-token context window, {info.reply_reserve.toLocaleString()} tokens are reserved for the response and {safetyReserve.toLocaleString()} for safety.</p>
+      <p>The response limit is separate from the context window. Increasing the context budget does not increase the response limit.</p>
       <p>Compactions: {info.compactions}. Messages summarized: {info.summarized_messages}.</p>
       <p className="context-heading">Loaded project instructions</p>
-      {info.instruction_files.length ? <ul>{info.instruction_files.map(file => <li key={file}><code>{file}</code></li>)}</ul> : <p>No project instruction files loaded.</p>}
+      {info.instruction_sources?.length ? <>
+        <ul>{info.instruction_sources.map(source => <li key={source.path}>
+          <code>{source.path}</code> · scope: <code>{source.scope}</code> and descendants · {source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens` : 'Omitted · 0 tokens loaded'}
+          {source.reason ? <p>{source.reason}</p> : null}
+        </li>)}</ul>
+        <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.</p>
+      </> : info.instruction_files.length ? <ul>{info.instruction_files.map(file => <li key={file}><code>{file}</code></li>)}</ul> : <p>No project instruction files loaded.</p>}
       {info.warnings.length ? <><p className="context-heading">Warnings</p><ul className="context-warnings">{info.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></> : null}
+      {onCompact ? <form className="context-compact" onSubmit={event => {
+        event.preventDefault()
+        if (busy || submitting) return
+        setSubmitting(true)
+        setError('')
+        void onCompact(note.trim()).catch(reason => setError(reason.message)).finally(() => setSubmitting(false))
+      }}>
+        <label>Preservation note (optional)<textarea value={note} maxLength={1000} disabled={busy || submitting}
+          onChange={event => setNote(event.target.value)} placeholder="Decisions or details to preserve in the summary" /></label>
+        <p>Summarizes earlier turns using your model and may add inference charges. Full history and the latest turn stay intact. Use Stop to cancel.</p>
+        <button type="submit" className="outline" disabled={busy || submitting}>{submitting ? 'Starting compaction…' : 'Compact now'}</button>
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+      </form> : null}
     </div>
   </details>
 }

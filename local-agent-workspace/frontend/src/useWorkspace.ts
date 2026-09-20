@@ -237,6 +237,14 @@ export function useWorkspace() {
     if (selected.current.id === id) newConversation()
     await refreshSessions()
   }
+  const renameSession = async (id: string, title: string) => {
+    const updated = await api<Session>(`/sessions/${encodeURIComponent(id)}/title`, 'PUT', { title })
+    // A summary captured before the rename must not restore the old title.
+    sessionsRequest.current++
+    setSessions(current => current.map(item => item.id === id ? { ...item, title: updated.title } : item))
+    // Renaming never replaces live events/status or changes the selected chat.
+    setSession(current => current?.id === id ? { ...current, title: updated.title } : current)
+  }
   const setPermissionMode = async (permission_mode: PermissionMode) => {
     const target = selected.current
     if (activeId) {
@@ -266,7 +274,7 @@ export function useWorkspace() {
   const activeSession = session?.id === activeId ? session : null
   const reportError = (message: string) => { if (selected.current.key === selection.key) setError(message) }
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
-    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, changeModel,
+    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder }
 }

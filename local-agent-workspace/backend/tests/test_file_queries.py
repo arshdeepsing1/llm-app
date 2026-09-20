@@ -13,6 +13,59 @@ def size(result):
     return len(json.dumps(result, indent=2).encode("utf-8"))
 
 
+async def test_large_external_listing_pages_without_losing_entries(tmp_path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    external = tmp_path / ("long-backup-path-" * 8)
+    external.mkdir()
+    for index in range(110):
+        (external / f"{index:03d}-session-日😀.jsonl").touch()
+    (external / ".env").write_text("excluded")
+    tools = WorkspaceTools(str(workspace), allowed_directories=[str(external)])
+    expected = tools.list_files(str(external))
+    assert size(expected) > tools_module.QUERY_OUTPUT_LIMIT
+    entries, offset, pages = [], 0, 0
+    while True:
+        page = await tools.execute("list_files", {"path": str(external), "offset": offset})
+        assert size(page) <= tools_module.QUERY_OUTPUT_LIMIT
+        assert not page["listing_limit_reached"]
+        entries.extend(page["entries"])
+        pages += 1
+        if page["next_offset"] is None:
+            assert not page["truncated"]
+            break
+        assert page["truncated"] and page["next_offset"] > offset
+        offset = page["next_offset"]
+    assert pages > 1
+    assert entries == expected
+    assert all(entry["name"] != ".env" for entry in entries)
+
+
+def test_listing_reports_existing_discovery_cap(tmp_path):
+    for index in range(301):
+        (tmp_path / f"{index:03d}.txt").touch()
+    tools = WorkspaceTools(str(tmp_path))
+    page = tools.list_files_page(offset=299)
+    assert [entry["name"] for entry in page["entries"]] == ["299.txt"]
+    assert page["listing_limit_reached"] and page["next_offset"] is None
+    assert len(tools.list_files()) == 300  # Explorer retains its existing list shape.
+
+
+def test_listing_final_page_metadata_fits_byte_limit(tmp_path, monkeypatch):
+    (tmp_path / "file.txt").touch()
+    tools = WorkspaceTools(str(tmp_path))
+    final_size = size(tools.list_files_page())
+    monkeypatch.setattr(tools_module, "QUERY_OUTPUT_LIMIT", final_size - 1)
+    with pytest.raises(ValueError, match="file entry exceeds"):
+        tools.list_files_page()
+
+
+@pytest.mark.parametrize("offset", [-1, 301, True, "1"])
+def test_listing_rejects_invalid_page_offsets(tmp_path, offset):
+    with pytest.raises(ValueError, match="offset"):
+        WorkspaceTools(str(tmp_path)).list_files_page(offset=offset)
+
+
 @pytest.mark.parametrize("trailing_newline", [False, True])
 def test_range_page_boundaries_and_eof(tmp_path, trailing_newline):
     (tmp_path / "lines.txt").write_text("one\ntwo\nthree" + ("\n" if trailing_newline else ""))

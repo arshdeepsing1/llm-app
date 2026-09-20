@@ -3,6 +3,8 @@ import json
 import time
 import uuid
 
+from .tool_profiles import child_profile
+
 
 class TaskManager:
     def __init__(self, store):
@@ -96,6 +98,48 @@ class DelegateManager:
     def children(self, parent_id):
         return [session for session in self.manager.store.list() if session.get("parent_session_id") == parent_id]
 
+    def recover(self):
+        for summary in self.manager.store.list():
+            child = self.manager.store.get(summary["id"])
+            progress = child.get("delegation")
+            if not progress or not child.get("parent_event_id"):
+                continue
+            if not progress.get("terminal_reason"):
+                progress = {**progress, "status": "interrupted", "terminal_reason": "interrupted"}
+                child.update(delegation=progress, terminal_reason="interrupted")
+                self.manager.store.save(child)
+            parent = self.manager.store.get(child["parent_session_id"])
+            event = next((item for item in (parent or {}).get("events", [])
+                          if item["id"] == child["parent_event_id"] and item.get("child_session_id") == child["id"]), None)
+            if event is not None and not event.get("delegation", {}).get("terminal_reason"):
+                event["delegation"] = dict(progress)
+                self.manager.store.save(parent)
+
+    async def progress(self, child, status=None, terminal_reason=None):
+        previous = child.get("delegation")
+        if previous is None or previous.get("terminal_reason"):
+            return
+        tools = [event for event in child["events"] if event["type"] == "tool"]
+        progress = {**previous, "completed_tools": sum(event.get("state") == "completed" for event in tools)}
+        if tools:
+            progress["last_tool"] = self.manager.settings.redact(str(tools[-1].get("name", "Tool")))[:160]
+        if terminal_reason:
+            progress.update(terminal_reason=terminal_reason,
+                            status={"completed": "completed", "stopped": "cancelled", "interrupted": "interrupted"}.get(terminal_reason, "failed"))
+        elif status and status != "idle":
+            progress["status"] = status
+        if progress == previous:
+            return
+        child["delegation"] = progress
+        if terminal_reason:
+            child["terminal_reason"] = terminal_reason
+        self.manager.store.save(child)
+        parent = self.manager.get(child["parent_session_id"])
+        event = next((item for item in (parent or {}).get("events", [])
+                      if item["id"] == child["parent_event_id"] and item.get("child_session_id") == child["id"]), None)
+        if event is not None and not event.get("delegation", {}).get("terminal_reason"):
+            await self.manager.update_event(parent, event, delegation=dict(progress))
+
     async def cancel_parent(self, parent_id):
         entry = self.active.get(parent_id)
         if entry:
@@ -106,7 +150,7 @@ class DelegateManager:
                 if self.active.get(parent_id) is entry:
                     self.active.pop(parent_id)
 
-    async def delegate(self, parent_session, task, context="", max_steps=6):
+    async def delegate(self, parent_session, task, context="", max_steps=6, parent_event=None, tool_profile=None):
         parent = self.manager.get(parent_session["id"])
         if not parent:
             raise ValueError("Parent conversation not found.")
@@ -118,22 +162,34 @@ class DelegateManager:
             raise ValueError("A nonempty task and string context are required.")
         if type(max_steps) is not int or not 1 <= max_steps <= 8:
             raise ValueError("max_steps must be an integer from 1 to 8.")
+        profile = child_profile(parent, tool_profile)
         if parent["id"] in self.active:
             raise ValueError("A subagent is already running for this conversation.")
         if len(self.active) >= 3:
             raise ValueError("At most three subagents can run at once.")
+        if parent_event is not None:
+            parent_event = next((event for event in parent["events"] if event["id"] == parent_event["id"]), None)
+            if parent_event is None:
+                raise ValueError("The spawning action is not in the parent conversation.")
         child = self.manager.store.create({"workspace": parent["workspace"], "model": parent["model"]})
         child.update(parent_session_id=parent["id"], is_subagent=True, max_steps=max_steps,
+                     tool_profile=profile,
                      permission_mode=parent.get("permission_mode", "manual"),
                      allowed_directories=list(parent.get("allowed_directories", [])))
+        event_id = parent_event["id"] if parent_event is not None else str(uuid.uuid4())
+        child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
+                     delegation={"status": "running", "completed_tools": 0})
         self.manager.store.save(child)
         entry = {"child_session_id": child["id"], "cancelled": False}
         self.active[parent["id"]] = entry
         failure = ""
         worker = None
         try:
-            if hasattr(self.manager, "event"):
-                await self.manager.event(parent, "notice", text=f"Subagent created for: {task[:160]}", child_session_id=child["id"])
+            if parent_event is None:
+                await self.manager.event(parent, "notice", id=event_id, text=f"Subagent created for: {task[:160]}",
+                                         child_session_id=child["id"], delegation=dict(child["delegation"]))
+            else:
+                await self.manager.update_event(parent, parent_event, child_session_id=child["id"], delegation=dict(child["delegation"]))
             prompt = f"Delegated task:\n{task}"
             if context:
                 prompt += f"\n\nParent-provided context:\n{context}"
@@ -145,12 +201,15 @@ class DelegateManager:
                 if asyncio.current_task().cancelling():
                     raise
                 entry["cancelled"] = True
+                await self.manager.stop(child["id"])
         except asyncio.CancelledError:
             entry["cancelled"] = True
             await self.manager.stop(child["id"])
+            await self.progress(self.manager.get(child["id"]) or child, terminal_reason="stopped")
             raise
         except Exception as exc:
             failure = self.manager.settings.redact(str(exc)) or type(exc).__name__
+            await self.progress(self.manager.get(child["id"]) or child, terminal_reason="error")
         finally:
             if self.active.get(parent["id"]) is entry:
                 self.active.pop(parent["id"])
@@ -162,10 +221,12 @@ class DelegateManager:
             errors.append(failure)
         cancelled = entry["cancelled"] or (worker is not None and (worker.cancelled() or worker.cancelling()))
         cancelled = cancelled or any(event.get("state") == "cancelled" for event in events)
-        status = "cancelled" if cancelled else "failed" if errors else "completed"
+        reason = "stopped" if cancelled else saved.get("terminal_reason") or ("error" if errors else "completed")
+        status = "cancelled" if cancelled or reason == "stopped" else "failed" if errors or reason != "completed" else "completed"
+        await self.progress(saved, terminal_reason=reason)
         reply = next((event.get("text", "") for event in reversed(events) if event.get("type") == "assistant" and event.get("text")), "")
         output = ("Errors:\n" + "\n".join(errors) + "\n\n" if errors else "") + (reply or "No final assistant reply was produced.")
-        result = {"child_session_id": child["id"], "status": status, "output": output}
+        result = {"child_session_id": child["id"], "status": status, "terminal_reason": reason, "output": output}
         if len(json.dumps(result, indent=2).encode("utf-8")) > 6000:
             low, high = 0, len(output)
             while low < high:

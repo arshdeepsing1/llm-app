@@ -129,7 +129,7 @@ def test_combined_limit_counts_utf8_bytes_and_keeps_whole_files(tmp_path):
 
 def test_missing_files_are_ignored_and_directives_are_plain_data(tmp_path):
     tools = WorkspaceTools(str(tmp_path))
-    assert load_project_instructions(tools) == {"text": "", "files": [], "warnings": []}
+    assert load_project_instructions(tools) == {"text": "", "files": [], "warnings": [], "sources": []}
     instructions = "@import other.md\n$(touch should-not-exist)\nprint('do not execute')"
     write(tmp_path, "AGENTS.md", instructions)
     write(tmp_path, "other.md", "not imported")

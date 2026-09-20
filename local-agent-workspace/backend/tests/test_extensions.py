@@ -60,6 +60,20 @@ def test_http_config_and_server_caps():
         validate_config({"servers": [{**server, "id": f"remote{n}"} for n in range(5)]})
 
 
+def test_hook_selectors_and_failure_phase_roundtrip(manager):
+    manager.update_config({"hooks": [hook("true", event="tool_failure", tools=["write_file", "mcp__demo__echo"])]})
+    assert manager.public_config()["hooks"][0]["tools"] == ["write_file", "mcp__demo__echo"]
+    assert ExtensionManager(manager.settings).public_config() == manager.public_config()
+    assert "tools" not in validate_config({"hooks": [hook("true")]})["hooks"][0]
+    assert validate_config({"hooks": [hook("true", tools=[])]})["hooks"][0]["tools"] == []
+
+
+@pytest.mark.parametrize("selectors", ["read_file", ["*"], ["read_.*"], ["read_file", "read_file"], [None], ["x" * 65], [f"tool{n}" for n in range(65)]])
+def test_hook_selectors_require_unique_exact_tool_names(selectors):
+    with pytest.raises(ValueError, match="exact tool names"):
+        validate_config({"hooks": [hook("true", tools=selectors)]})
+
+
 def test_skills_discover_only_workspace_agents_and_load_bounded_text(manager, tmp_path):
     tools = WorkspaceTools(str(tmp_path))
     folder = tmp_path / ".agents/skills/review"

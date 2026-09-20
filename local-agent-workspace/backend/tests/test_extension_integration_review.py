@@ -42,6 +42,7 @@ async def test_mcp_rechecks_guidance_after_approval_and_before_hook(runtime, cha
 
     class Connection:
         tool_names = {"mcp__demo__change"}
+        definitions = [{"function": {"name": "mcp__demo__change", "parameters": {"type": "object"}}}]
 
         async def call(self, name, arguments):
             calls.append(name)
@@ -94,7 +95,8 @@ async def test_mcp_rpc_error_is_bounded_before_reaching_model_history(runtime):
             raise ValueError("Provider error: " + "🌍" * 5000)
 
     connection = MCPConnection([], lambda text: text)
-    connection.registry = {"mcp__demo__fail": {"session": FailedRPC(), "tool_name": "fail", "server_id": "demo"}}
+    connection.registry = {"mcp__demo__fail": {"session": FailedRPC(), "tool_name": "fail", "server_id": "demo", "schema": {"type": "object"}}}
+    connection.definitions = [{"function": {"name": "mcp__demo__fail", "parameters": {"type": "object"}}}]
     connection.tool_names = {"mcp__demo__fail"}
     connection._discovered = True
     manager.extension_connections[session["id"]] = connection
@@ -151,9 +153,11 @@ async def test_api_rejects_extension_changes_and_tests_while_mcp_call_is_active(
     closed = []
 
     class Connection:
+        definitions = [{"type": "function", "function": {"name": "mcp__demo__slow", "description": "Slow operation",
+            "parameters": {"type": "object", "properties": {}}}}]
+
         async def discover(self):
-            return [{"type": "function", "function": {"name": "mcp__demo__slow", "description": "Slow operation",
-                "parameters": {"type": "object", "properties": {}}}}]
+            return self.definitions
 
         async def call(self, name, arguments):
             called.set()

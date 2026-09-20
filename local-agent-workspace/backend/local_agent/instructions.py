@@ -4,6 +4,7 @@ import stat
 from pathlib import Path
 
 from .tools import WorkspaceTools, file_error
+from .context import estimate_text_tokens
 
 MAX_INSTRUCTION_BYTES = 16_000
 PREAMBLE = (
@@ -15,7 +16,7 @@ PREAMBLE = (
 
 def load_project_instructions(tools: WorkspaceTools, directories=()) -> dict:
     folders = {Path(".")}
-    files, warnings, sections = [], [], []
+    files, warnings, sections, sources = [], [], [], []
 
     def workspace_path(relative):
         target = tools.path(str(relative))
@@ -57,8 +58,13 @@ def load_project_instructions(tools: WorkspaceTools, directories=()) -> dict:
                 used += size
                 sections.append(section)
                 files.append(label)
+                sources.append({"path": label, "scope": folder.as_posix(), "status": "loaded",
+                                "estimated_tokens": estimate_text_tokens(section)})
             except FileNotFoundError:
                 continue
             except (ValueError, OSError, RuntimeError) as exc:
                 warnings.append(f"{label}: {file_error(exc)}")
-    return {"text": PREAMBLE + "".join(sections) if sections else "", "files": files, "warnings": warnings}
+                sources.append({"path": label, "scope": folder.as_posix(), "status": "omitted",
+                                "estimated_tokens": 0, "reason": file_error(exc)})
+    return {"text": PREAMBLE + "".join(sections) if sections else "", "files": files,
+            "warnings": warnings, "sources": sources}

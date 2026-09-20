@@ -278,3 +278,180 @@ async def test_delegate_bounds_unicode_serialized_result_and_handles_worker_fail
     result = await helper.delegate(parent, "Inspect again")
     assert result["status"] == "failed" and "Synthetic worker failure" in result["output"]
     assert helper.active == {}
+
+
+async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads(delegation):
+    manager, helper, parent = delegation
+    manager.live[parent["id"]] = parent
+    spawning = await manager.event(parent, "tool", name="delegate_task", call_id="call-review",
+                                   input={"task": "Inspect source"}, output="", state="running")
+    ready, release = asyncio.Event(), asyncio.Event()
+    async def worker(child, prompt):
+        action = await manager.event(child, "tool", name="read_file", input={"path": "private.py"},
+                                     state="pending", output="private child contents")
+        await manager.status(child, "awaiting_approval")
+        ready.set()
+        await release.wait()
+        await manager.update_event(child, action, state="completed")
+        await manager.update_event(child, action, state="completed")
+        await manager.status(child, "running")
+        await manager.event(child, "assistant", text="Reviewed.")
+    manager.run_databricks = worker
+    pending = asyncio.create_task(helper.delegate(parent, "Inspect source", parent_event=spawning))
+    await asyncio.wait_for(ready.wait(), 1)
+    saved = manager.store.get(parent["id"])
+    event = saved["events"][0]
+    child = manager.store.get(event["child_session_id"])
+    assert child["parent_event_id"] == spawning["id"] and child["parent_call_id"] == "call-review"
+    assert child["events"][0]["origin"] == {"kind": "delegated", "parent_session_id": parent["id"],
+                                            "parent_event_id": spawning["id"], "parent_call_id": "call-review"}
+    assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file"}
+    assert "private child contents" not in json.dumps(saved)
+    assert saved["wire"] == []
+    release.set()
+    result = await pending
+    assert result["status"] == result["terminal_reason"] == "completed"
+    progress = manager.store.get(parent["id"])["events"][0]["delegation"]
+    assert progress == {"status": "completed", "completed_tools": 1, "last_tool": "read_file", "terminal_reason": "completed"}
+    await helper.progress(manager.store.get(child["id"]), status="running", terminal_reason="stopped")
+    assert manager.store.get(parent["id"])["events"][0]["delegation"] == progress
+
+
+async def test_delegation_provenance_is_only_on_initial_prompt_and_ids_do_not_cross(delegation):
+    manager, helper, parent = delegation
+    async def worker(child, prompt):
+        await manager.event(child, "assistant", text="Done")
+    manager.run_databricks = worker
+    first = await helper.delegate(parent, "First")
+    second = await helper.delegate(parent, "Second")
+    children = [manager.store.get(result["child_session_id"]) for result in (first, second)]
+    assert children[0]["parent_event_id"] != children[1]["parent_event_id"]
+    before = manager.store.get(parent["id"])
+    manager.start(children[0]["id"], "A new human follow-up")
+    await manager.tasks[children[0]["id"]]
+    users = [event for event in manager.store.get(children[0]["id"])["events"] if event["type"] == "user"]
+    assert users[0]["origin"]["kind"] == "delegated"
+    assert "origin" not in users[1]
+    assert manager.store.get(parent["id"]) == before
+
+
+@pytest.mark.parametrize("reason", ["step_limit", "inference_error", "tool_error", "stopped"])
+async def test_parent_retains_structured_child_stop_reason(delegation, reason):
+    from local_agent.telemetry import InferenceError
+    manager, helper, parent = delegation
+    async def worker(child, prompt):
+        if reason == "step_limit":
+            await manager.event(child, "error", text="Step limit reached", terminal_reason="step_limit")
+        elif reason == "inference_error":
+            raise InferenceError("Response truncated", "output_limit")
+        elif reason == "tool_error":
+            await manager.event(child, "tool", name="read_file", state="error", output="Missing file")
+            await manager.event(child, "assistant", text="Partial findings")
+        else:
+            raise asyncio.CancelledError
+    manager.run_databricks = worker
+    result = await helper.delegate(parent, "Review")
+    assert result["terminal_reason"] == reason
+    child = manager.store.get(result["child_session_id"])
+    assert child["terminal_reason"] == reason
+    progress = manager.store.get(parent["id"])["events"][-1]["delegation"]
+    assert progress["terminal_reason"] == reason
+    assert progress["status"] == ("cancelled" if reason == "stopped" else "failed")
+
+
+async def test_child_cancelled_before_first_schedule_has_terminal_progress(delegation, monkeypatch):
+    manager, helper, parent = delegation
+    original = manager.start
+    def start(session_id, prompt):
+        original(session_id, prompt)
+        manager.tasks[session_id].cancel()
+    monkeypatch.setattr(manager, "start", start)
+    result = await helper.delegate(parent, "Never started")
+    assert result["terminal_reason"] == "stopped" and result["status"] == "cancelled"
+    assert result["child_session_id"] not in manager.live
+    assert manager.statuses[result["child_session_id"]] == "idle"
+    assert helper.active == {}
+    progress = manager.store.get(parent["id"])["events"][-1]["delegation"]
+    assert progress == {"status": "cancelled", "completed_tools": 0, "terminal_reason": "stopped"}
+    monkeypatch.setattr(manager, "start", original)
+    manager.run_databricks = lambda session, prompt: asyncio.sleep(0)
+    manager.start(result["child_session_id"], "Human follow-up after cancellation")
+    await manager.tasks[result["child_session_id"]]
+    assert "origin" not in manager.store.get(result["child_session_id"])["events"][0]
+
+
+async def test_delegation_reserves_capacity_before_publishing_and_cleans_up_cancelled_creation(delegation, monkeypatch):
+    manager, helper, parent = delegation
+    publishing = asyncio.Event()
+    first = True
+    async def broadcast(session_id, data):
+        nonlocal first
+        if first:
+            first = False
+            publishing.set()
+            await asyncio.Event().wait()
+    monkeypatch.setattr(manager, "broadcast", broadcast)
+    pending = asyncio.create_task(helper.delegate(parent, "Slow notification"))
+    await asyncio.wait_for(publishing.wait(), 1)
+    with pytest.raises(ValueError, match="already running"):
+        await helper.delegate(parent, "Duplicate")
+    assert len(helper.children(parent["id"])) == 1
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert helper.active == {}
+    assert manager.store.get(parent["id"])["events"][-1]["delegation"]["terminal_reason"] == "stopped"
+
+
+async def test_parent_cancellation_during_unscheduled_child_cleanup_propagates(delegation, monkeypatch):
+    manager, helper, parent = delegation
+    original_start, original_stop = manager.start, manager.stop
+    cleanup_started = asyncio.Event()
+    first = True
+    def start(session_id, prompt):
+        original_start(session_id, prompt)
+        manager.tasks[session_id].cancel()
+    async def stop(session_id):
+        nonlocal first
+        if first:
+            first = False
+            cleanup_started.set()
+            await asyncio.Event().wait()
+        await original_stop(session_id)
+    monkeypatch.setattr(manager, "start", start)
+    monkeypatch.setattr(manager, "stop", stop)
+    pending = asyncio.create_task(helper.delegate(parent, "Never started"))
+    await asyncio.wait_for(cleanup_started.wait(), 1)
+    child_id = helper.active[parent["id"]]["child_session_id"]
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert child_id not in manager.live and manager.statuses[child_id] == "idle"
+    assert helper.active == {}
+    assert manager.store.get(parent["id"])["events"][-1]["delegation"]["terminal_reason"] == "stopped"
+
+
+async def test_restart_marks_active_delegation_interrupted_and_preserves_terminal_result(delegation):
+    manager, helper, parent = delegation
+    async def worker(child, prompt):
+        await manager.event(child, "assistant", text="Finished")
+    manager.run_databricks = worker
+    completed = await helper.delegate(parent, "Completed work")
+    saved_parent = manager.store.get(parent["id"])
+    finished_progress = saved_parent["events"][-1]["delegation"]
+    child = manager.store.create(manager.settings.values)
+    spawning = await manager.event(saved_parent, "tool", name="delegate_task", state="running", child_session_id=child["id"],
+                                   delegation={"status": "awaiting_approval", "completed_tools": 1, "last_tool": "run_command"})
+    child.update(parent_session_id=parent["id"], parent_event_id=spawning["id"], is_subagent=True,
+                 delegation=dict(spawning["delegation"]))
+    manager.store.save(child)
+    restarted = AgentManager(manager.store, manager.settings)
+    try:
+        progress = manager.store.get(parent["id"])["events"][-1]["delegation"]
+        assert progress == {"status": "interrupted", "completed_tools": 1, "last_tool": "run_command", "terminal_reason": "interrupted"}
+        assert manager.store.get(child["id"])["terminal_reason"] == "interrupted"
+        assert manager.store.get(completed["child_session_id"])["delegation"] == finished_progress
+        restarted.delegates.recover()
+        assert manager.store.get(parent["id"])["events"][-1]["delegation"] == progress
+    finally:
+        await restarted.jobs.shutdown()

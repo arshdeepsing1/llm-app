@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .tools import LIMIT
+from .tools import LIMIT, file_error
 
 
 def _state(content=None, mode=None, identity=None):
@@ -103,7 +103,7 @@ class CheckpointManager:
     def _metadata(record):
         return {key: record[key] for key in ("id", "workspace", "session_id", "path", "created", "status", "restores")} | {
             "before_exists": record["before"]["exists"], "after_exists": record["after"]["exists"],
-            "after_hash": record["after"]["hash"]}
+            "after_hash": record["after"]["hash"], "turn_id": record.get("turn_id")}
 
     def list(self, session_id=None, workspace=None):
         workspace = str(Path(workspace).expanduser().resolve()) if workspace is not None else None
@@ -165,10 +165,10 @@ class CheckpointManager:
                 except FileNotFoundError:
                     pass
 
-    def _apply(self, tools, path, target, before, after, session_id, restores=None):
+    def _apply(self, tools, path, target, before, after, session_id, restores=None, turn_id=None):
         record = {"id": str(uuid.uuid4()), "workspace": str(tools.root), "session_id": session_id,
                   "path": path, "target": str(target), "created": time.time(), "status": "pending",
-                  "before": before, "after": after, "restores": restores}
+                  "before": before, "after": after, "restores": restores, "turn_id": turn_id}
         # The original bytes are durable before any application write occurs.
         self._save(record)
         applied = False
@@ -189,7 +189,7 @@ class CheckpointManager:
             raise
         return record
 
-    def apply_edit(self, tools, name, arguments, session_id=None):
+    def apply_edit(self, tools, name, arguments, session_id=None, turn_id=None):
         if name not in ("write_file", "edit_file"):
             raise ValueError("Only app file writes and edits can create checkpoints.")
         target = tools.path(arguments["path"])
@@ -209,7 +209,7 @@ class CheckpointManager:
         after = _state(raw, before["mode"] if before["exists"] else 0o600)
         if before["hash"] == after["hash"]:
             return "No changes."
-        self._apply(tools, arguments["path"], target, before, after, session_id)
+        self._apply(tools, arguments["path"], target, before, after, session_id, turn_id=turn_id)
         return preview if preview != "No changes." else _diff(before, after, tools.display_path(target))
 
     def preview(self, checkpoint_id, tools, session_id=None):
@@ -222,6 +222,25 @@ class CheckpointManager:
             result["error"] = ("This checkpoint has already been restored." if record["status"] == "restored"
                                else "File changed since this app edit; recovery will not overwrite those changes.")
         return result
+
+    def preview_turn(self, turn_id, tools, session_id, offset=0):
+        records = [item for item in self.list(session_id, str(tools.root))
+                   if item["session_id"] == session_id and item["turn_id"] == turn_id]
+        if not turn_id or not records:
+            raise ValueError("No checkpoints found for this turn in this conversation or workspace.")
+        if type(offset) is not int or not 0 <= offset < len(records):
+            raise ValueError("offset must identify a checkpoint in this turn.")
+        previews = []
+        # Keep multi-file previews bounded; individual restores retain all their checks.
+        for record in records[offset:offset + 10]:
+            try:
+                previews.append(self.preview(record["id"], tools, session_id))
+            except (ValueError, OSError, UnicodeError) as exc:
+                previews.append({"id": record["id"], "path": record["path"], "diff": "",
+                                 "expected_current_hash": "", "can_restore": False, "error": file_error(exc)})
+        next_offset = offset + len(previews)
+        return {"turn_id": turn_id, "previews": previews,
+                "next_offset": next_offset if next_offset < len(records) else None}
 
     def restore(self, checkpoint_id, tools, expected_current_hash, session_id=None):
         record, target = self._get(checkpoint_id, tools, session_id)

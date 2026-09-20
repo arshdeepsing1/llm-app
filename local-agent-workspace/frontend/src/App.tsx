@@ -45,6 +45,7 @@ export default function App() {
     <Sidebar settings={app.settings} connection={app.connection} sessions={app.sessions} activeId={app.activeId}
       open={sidebarOpen} close={() => setSidebarOpen(false)} onNew={app.newConversation}
       onSelect={app.setActiveId} onSettings={() => setSettingsOpen(true)}
+      onRename={app.renameSession}
       onDelete={id => void app.deleteSession(id).catch(e => showError(e.message))} />
     <main className="main-area">
       <header className="topbar"><button className="icon-button mobile-only" aria-label="Open sidebar" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
@@ -67,13 +68,16 @@ export default function App() {
         {active?.status === 'awaiting_approval' ? <p className="composer-hint" role="status">An action is waiting for your approval above.</p> : null}
         {active?.status === 'compacting' ? <p className="composer-hint" role="status">Compacting context…</p> : null}
         {active?.status === 'naming' ? <p className="composer-hint" role="status">Creating conversation title…</p> : null}
-        <ContextMeter key={`context-${app.viewKey}`} info={active?.context_info} />
+        <ContextMeter key={`context-${app.viewKey}`} info={active?.context_info} busy={busy}
+          onCompact={active && app.ready && app.online && app.settings?.configured ? async preservationNote => {
+            await api(`/sessions/${encodeURIComponent(active.id)}/compact`, 'POST', { preservation_note: preservationNote })
+          } : undefined} />
       </div>
     </main>
     {workspaceOpen && app.settings && (!app.activeId || active) ? <WorkspacePanel key={editorKey} sessionId={app.activeId}
       workspace={workspace} file={editorDrafts[editorKey] || null} setFile={setEditorFile} onClose={() => setWorkspaceOpen(false)}
       onAttach={path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the project file: ${path}`); setWorkspaceOpen(false) }} /> : null}
-    {agentToolsOpen && app.settings && (!app.activeId || active) ? <AgentToolsDialog key={editorKey} session={active} onClose={() => setAgentToolsOpen(false)} onError={showError} onSelectSession={id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} /> : null}
+    {agentToolsOpen && app.settings && (!app.activeId || active) ? <AgentToolsDialog key={editorKey} session={active} workspace={workspace} onClose={() => setAgentToolsOpen(false)} onError={showError} onSelectSession={id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} /> : null}
     {settingsOpen && app.settings ? <SettingsDialog settings={app.settings} connection={app.connection} onSave={app.saveSettings} onClose={() => setSettingsOpen(false)} /> : null}
     {foldersOpen && app.settings ? <FolderAccessDialog key={app.viewKey} workspace={active?.workspace || app.settings.workspace} folders={active?.allowed_directories || []}
       busy={busy || (!!app.activeId && !active)} bypass={app.permissionMode === 'bypassPermissions'} onAllow={app.allowFolder} onRemove={app.removeFolder} onClose={() => setFoldersOpen(false)} /> : null}

@@ -19,16 +19,24 @@ export class ApiError extends Error {
   constructor(message: string, status: number) { super(message); this.status = status }
 }
 export async function api<T>(path: string, method = 'GET', body?: unknown, retried = false): Promise<T> {
+  return request<T>(path, method, body === undefined ? undefined : JSON.stringify(body), retried)
+}
+// Preserve the uploaded JSON text so the server can reject duplicate keys and
+// invalid numbers before any parser has silently normalized them.
+export async function apiJsonText<T>(path: string, body: string): Promise<T> {
+  return request<T>(path, 'POST', body)
+}
+async function request<T>(path: string, method: string, body?: string, retried = false): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method, headers: { 'Content-Type': 'application/json', 'X-Local-Token': token },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body,
   })
   const data = await response.json()
   // This response is emitted before the server executes the request, so one
   // retry after replacing an expired local token cannot duplicate an action.
   if (response.status === 403 && data.code === 'reconnect_required' && !retried) {
     await refreshToken()
-    return api<T>(path, method, body, true)
+    return request<T>(path, method, body, true)
   }
   if (!response.ok) throw new ApiError(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data), response.status)
   return data

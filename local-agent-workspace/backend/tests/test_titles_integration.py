@@ -278,6 +278,7 @@ async def test_child_title_cancellation_preserves_completed_handback_unless_pare
         assert result == {
             "child_session_id": child_id,
             "status": "cancelled" if cancel_parent else "completed",
+            "terminal_reason": "stopped" if cancel_parent else "completed",
             "output": "The parser handles all inspected inputs.",
         }
         saved = manager.store.get(child_id)

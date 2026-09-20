@@ -42,13 +42,14 @@ def mock_gateway(monkeypatch, gateway):
 
 def long_history(session):
     session["wire"] = [message for i in range(4) for message in (
-        {"role": "user", "content": f"Earlier request {i}: " + "x" * 7000},
+        {"role": "user", "content": f"Earlier request {i}: " + "x" * 21000},
         {"role": "assistant", "content": f"Completed step {i}."})]
     session["events"] = [{"id": "old", "type": "user", "text": "Full transcript remains available."}]
 
 
 async def test_compaction_preserves_archive_and_survives_restart(runtime, monkeypatch):
     manager, session, project = runtime
+    manager.settings.values["context_window"] = 32768
     (project / "AGENTS.md").write_text("Project rule: use focused changes.")
     long_history(session)
     archive = copy.deepcopy(session["wire"])
@@ -79,6 +80,9 @@ async def test_compaction_preserves_archive_and_survives_restart(runtime, monkey
     assert any(update["type"] == "context" for update in updates)
     saved = manager.store.get(session["id"])
     assert saved["context_state"] == session["context_state"]
+    assert saved["context_info"]["breakdown"] == session["context_info"]["breakdown"]
+    assert saved["context_info"]["breakdown"]["summary"] > 0
+    assert sum(saved["context_info"]["breakdown"].values()) == saved["context_info"]["estimated_tokens"]
     assert "context_state" not in public_session(saved)
     assert "context_state" not in manager.store.list()[0]
     prior_summaries = sum(not item["stream"] for item in requests)
@@ -91,6 +95,7 @@ async def test_compaction_preserves_archive_and_survives_restart(runtime, monkey
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_failed_or_cancelled_compaction_does_not_commit(runtime, monkeypatch, cancel):
     manager, session, _ = runtime
+    manager.settings.values["context_window"] = 32768
     long_history(session)
     archive = copy.deepcopy(session["wire"])
     manager.store.save(session)
@@ -119,12 +124,13 @@ async def test_failed_or_cancelled_compaction_does_not_commit(runtime, monkeypat
 
 async def test_oversize_current_turn_never_reaches_gateway(runtime, monkeypatch):
     manager, session, _ = runtime
+    manager.settings.values["context_window"] = 32768
     async def gateway(request):
         pytest.fail("An oversized request must not be sent")
     mock_gateway(monkeypatch, gateway)
-    await manager.run(session, "x" * 30000)
+    await manager.run(session, "x" * 90000)
     assert session["events"][-1]["type"] == "error"
-    assert session["wire"][-1]["content"] == "x" * 30000
+    assert session["wire"][-1]["content"] == "x" * 90000
 
 
 async def test_nested_write_defers_until_guidance_is_sent(runtime, monkeypatch):
@@ -173,14 +179,43 @@ async def test_instruction_warnings_are_visible(runtime, monkeypatch):
     assert "AGENTS.md" in session["context_info"]["warnings"][0]
 
 
-def test_context_setting_validation_and_legacy_client(runtime):
+@pytest.mark.parametrize("budget", [32768, 65536, 131000])
+def test_context_setting_validation_and_legacy_client(runtime, budget):
     manager, _, project = runtime
     settings = manager.settings
     editable = {"workspace": str(project), "model": "test-model", "env_file": ""}
     with TestClient(create_app(settings)) as client:
         headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
-        assert client.put("/api/settings", headers=headers, json={**editable, "context_window": 65536}).status_code == 200
-        assert client.put("/api/settings", headers=headers, json=editable).json()["context_window"] == 65536
+        assert client.put("/api/settings", headers=headers, json={**editable, "context_window": budget}).status_code == 200
+        assert client.put("/api/settings", headers=headers, json=editable).json()["context_window"] == budget
         for invalid in (True, 0, 10000000, 16384.5, "32768"):
             assert client.put("/api/settings", headers=headers, json={**editable, "context_window": invalid}).status_code == 422
-        assert Settings(settings.state_dir).values["context_window"] == 65536
+        assert Settings(settings.state_dir).values["context_window"] == budget
+
+
+@pytest.mark.parametrize("legacy_file", [False, True])
+def test_new_or_unset_context_settings_default_to_131000(tmp_path, monkeypatch, legacy_file):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    state = tmp_path / "state"
+    editable = {"workspace": str(tmp_path), "model": "test-model", "env_file": ""}
+    if legacy_file:
+        state.mkdir()
+        (state / "settings.json").write_text(json.dumps(editable))
+    settings = Settings(state)
+    assert settings.values["context_window"] == 131000
+    assert settings.update(editable)["context_window"] == 131000
+    assert Settings(state).values["context_window"] == 131000
+
+
+@pytest.mark.parametrize("budget", [32768, 131000])
+def test_explicit_saved_context_budget_is_preserved_on_load_and_other_settings_edits(tmp_path, monkeypatch, budget):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    saved = {"workspace": str(tmp_path), "model": "saved-model", "env_file": "", "context_window": budget}
+    (state / "settings.json").write_text(json.dumps(saved))
+    settings = Settings(state)
+    assert settings.values["context_window"] == budget
+    assert settings.update({"model": "another-model"})["context_window"] == budget
+    assert json.loads(settings.path.read_text())["context_window"] == budget
+    assert Settings(state).values["context_window"] == budget

@@ -5,11 +5,11 @@ import { useWorkspace } from '../src/useWorkspace'
 import type { ContextInfo, Session, Settings } from '../src/types'
 
 const settings: Settings = {
-  workspace: '/project', model: 'test-model', env_file: '', context_window: 32768, host: '', configured: true,
+  workspace: '/project', model: 'test-model', env_file: '', context_window: 131000, host: '', configured: true,
 }
 const contextInfo: ContextInfo = {
-  estimated_tokens: 12000, input_budget: 24000, context_window: 32768, reply_reserve: 8192,
-  compactions: 1, summarized_messages: 8, estimate_method: 'conservative_utf8',
+  estimated_tokens: 60380, input_budget: 120760, context_window: 131000, reply_reserve: 8192,
+  compactions: 1, summarized_messages: 8, estimate_method: 'weighted_utf8',
   instruction_files: ['AGENTS.md', 'src/AGENTS.md'], warnings: ['Project instructions were truncated.'],
 }
 const makeSession = (id: string, title = id): Session => ({
@@ -65,6 +65,12 @@ beforeEach(() => {
     if (path.startsWith('/api/files?')) return json([{ path: 'note.txt', name: 'note.txt', directory: false }])
     if (path.startsWith('/api/file?')) return json({ content: 'original' })
     if (path === '/api/file' || path.endsWith('/messages')) return json({ ok: true })
+    const titleId = path.match(/^\/api\/sessions\/([^/]+)\/title$/)?.[1]
+    if (titleId && options.method === 'PUT') {
+      const updated = { ...sessions.get(titleId)!, title: JSON.parse(options.body as string).title.trim().replace(/\s+/g, ' ') }
+      sessions.set(titleId, updated)
+      return json(updated)
+    }
     const modelId = path.match(/^\/api\/sessions\/([^/]+)\/model$/)?.[1]
     if (modelId && options.method === 'PUT') {
       const updated = { ...sessions.get(modelId)!, model: JSON.parse(options.body as string).model }
@@ -132,10 +138,12 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
   expect(dialog.getByLabelText('Databricks model endpoint')).toBeTruthy()
   expect(dialog.getByLabelText('Credential file')).toBeTruthy()
   const budget = dialog.getByLabelText<HTMLInputElement>('Context budget (tokens)')
-  expect(budget.value).toBe('32768')
+  expect(budget.value).toBe('131000')
   expect(budget.min).toBe('16384')
   expect(budget.max).toBe('1048576')
-  expect(dialog.getByText('Set at or below your endpoint limit. Applies on the next turn.')).toBeTruthy()
+  expect(dialog.getByText(/Set at or below your endpoint's total context limit, not your account usage quota/)).toBeTruthy()
+  expect(dialog.getByText(/reserve 8,192 tokens for the reply and 2,048 for a safety margin/)).toBeTruthy()
+  expect(dialog.getByText(/Responses are limited separately to 8,192 tokens per model call/)).toBeTruthy()
   expect(dialog.queryByLabelText('Agent runtime')).toBeNull()
   expect(dialog.queryByText(/Claude|MCP|skills/i)).toBeNull()
   expect(dialog.queryByRole('checkbox')).toBeNull()
@@ -148,6 +156,121 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
   const request = fetchMock.mock.calls.find(([path, options]) => path === '/api/settings' && options?.method === 'PUT')
   expect(JSON.parse(request![1]!.body as string)).toEqual({
     workspace: '/updated-project', model: 'databricks-gpt-oss-120b', env_file: '/credentials/env_vars.txt', context_window: 65536,
+  })
+})
+
+describe('conversation renaming', () => {
+  it('renames a running chat without replacing streamed events or status and prevents duplicate submits', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions/a/title' ? pending.promise : undefined
+    await renderApp()
+    const socket = await showSession('a')
+    act(() => socket.emit({ type: 'status', status: 'running' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Rename Other conversation' }))
+    const input = screen.getByRole<HTMLInputElement>('textbox', { name: 'Conversation name' })
+    expect(input.maxLength).toBe(160)
+    expect(document.activeElement).toBe(input)
+    fireEvent.change(input, { target: { value: '  Clear   project name  ' } })
+    const form = screen.getByRole('form', { name: 'Rename Other conversation' })
+    fireEvent.submit(form)
+    fireEvent.submit(form)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Saving…' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Cancel rename' }).disabled).toBe(true)
+    expect(input.disabled).toBe(true)
+    act(() => {
+      socket.emit({ type: 'event', event: { id: 'reply', type: 'assistant', text: 'Still ' } })
+      socket.emit({ type: 'delta', id: 'reply', text: 'streaming' })
+    })
+    await act(async () => pending.resolve(json({ ...makeSession('a', 'Clear project name'), events: [] })))
+    expect(within(screen.getByRole('main')).getByText('Clear project name')).toBeTruthy()
+    expect(screen.getByText('Still streaming')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Stop response' })).toBeTruthy()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Rename Clear project name' }))
+    const requests = fetchMock.mock.calls.filter(([path]) => path === '/api/sessions/a/title')
+    expect(requests).toHaveLength(1)
+    expect(requests[0][1]?.method).toBe('PUT')
+    expect(JSON.parse(requests[0][1]!.body as string)).toEqual({ title: '  Clear   project name  ' })
+  })
+
+  it('renames an inactive chat without selecting it or losing the active draft', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    sessions.set('b', makeSession('b', 'Second conversation'))
+    await renderApp()
+    await showSession('a')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Unsent draft' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename Second conversation' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Conversation name' }), { target: { value: 'Renamed second chat' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save name' }))
+    await screen.findByRole('button', { name: 'Rename Renamed second chat' })
+    expect(within(screen.getByRole('main')).getByText('Other conversation')).toBeTruthy()
+    expect(screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Message' }).value).toBe('Unsent draft')
+    expect(new URL(window.location.href).searchParams.get('session')).toBe('a')
+    expect(TestSocket.instances).toHaveLength(1)
+  })
+
+  it.each(['Escape', 'Cancel'])('cancels with %s, restores focus, and discards the edited name', async action => {
+    await renderApp()
+    fireEvent.click(screen.getByRole('button', { name: 'Rename Other conversation' }))
+    const input = screen.getByRole('textbox', { name: 'Conversation name' })
+    fireEvent.change(input, { target: { value: '   ' } })
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Save name' }).disabled).toBe(true)
+    fireEvent.change(input, { target: { value: 'Discard this name' } })
+    if (action === 'Escape') fireEvent.keyDown(input, { key: 'Escape' })
+    else fireEvent.click(screen.getByRole('button', { name: 'Cancel rename' }))
+    expect(screen.queryByRole('textbox', { name: 'Conversation name' })).toBeNull()
+    const button = screen.getByRole('button', { name: 'Rename Other conversation' })
+    expect(document.activeElement).toBe(button)
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith('/title'))).toBe(false)
+    fireEvent.click(button)
+    expect(screen.getByRole<HTMLInputElement>('textbox', { name: 'Conversation name' }).value).toBe('Other conversation')
+  })
+
+  it('keeps a failed rename editable and supports retry without changing the original title', async () => {
+    override = path => path === '/api/sessions/a/title' ? Promise.resolve(json({ detail: 'Could not save the conversation.' }, 503)) : undefined
+    await renderApp()
+    fireEvent.click(screen.getByRole('button', { name: 'Rename Other conversation' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Conversation name' }), { target: { value: 'Try this name' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save name' }))
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'Could not save the conversation.')
+    expect(screen.getByRole<HTMLInputElement>('textbox', { name: 'Conversation name' }).value).toBe('Try this name')
+    expect(sessions.get('a')?.title).toBe('Other conversation')
+    override = () => undefined
+    fireEvent.click(screen.getByRole('button', { name: 'Save name' }))
+    await screen.findByRole('button', { name: 'Rename Try this name' })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('does not reopen a chat when its rename response arrives after switching conversations', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    sessions.set('b', makeSession('b', 'Second conversation'))
+    const { result } = renderHook(useWorkspace)
+    await showSession('a')
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions/a/title' ? pending.promise : undefined
+    let saving!: Promise<void>
+    act(() => { saving = result.current.renameSession('a', 'Renamed first chat') })
+    act(() => result.current.setActiveId('b'))
+    const socket = await showSession('b')
+    act(() => socket.emit({ type: 'event', event: { id: 'b-reply', type: 'assistant', text: 'Second chat reply' } }))
+    await act(async () => { pending.resolve(json(makeSession('a', 'Renamed first chat'))); await saving })
+    expect(result.current.activeId).toBe('b')
+    expect(result.current.session?.title).toBe('Second conversation')
+    expect(result.current.session?.events[0].text).toBe('Second chat reply')
+    expect(result.current.sessions.find(item => item.id === 'a')?.title).toBe('Renamed first chat')
+  })
+
+  it('ignores sidebar summaries captured before a successful manual rename', async () => {
+    const { result } = renderHook(useWorkspace)
+    await waitFor(() => expect(result.current.ready).toBe(true))
+    const oldList = [...sessions.values()]
+    const pending = deferred<Response>()
+    override = path => path === '/api/sessions' ? pending.promise : undefined
+    let refreshing!: Promise<void>
+    act(() => { refreshing = result.current.refreshSessions() })
+    await act(async () => { await result.current.renameSession('a', 'A durable name') })
+    await act(async () => { pending.resolve(json(oldList)); await refreshing })
+    expect(result.current.sessions[0].title).toBe('A durable name')
   })
 })
 
@@ -335,7 +458,7 @@ describe('conversation models', () => {
     await act(async () => { pending.resolve(json(savedSettings)) })
     expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('other-model')
     const update = fetchMock.mock.calls.find(([path]) => path === '/api/settings')
-    expect(JSON.parse(update![1]!.body as string)).toEqual({ workspace: '/project', model: 'other-model', env_file: '', context_window: 32768 })
+    expect(JSON.parse(update![1]!.body as string)).toEqual({ workspace: '/project', model: 'other-model', env_file: '', context_window: 131000 })
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
     await showSession('created')
     expect(sessions.get('created')?.model).toBe('other-model')
@@ -407,6 +530,30 @@ describe('conversation models', () => {
 })
 
 describe('context budget', () => {
+  it('starts manual compaction for the active session and keeps Stop available during the update', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    sessions.set('a', { ...makeSession('a'), context_info: contextInfo })
+    override = path => path === '/api/sessions/a/compact' ? Promise.resolve(json({ ok: true }, 202)) : undefined
+    await renderApp()
+    const socket = await showSession('a')
+    fireEvent.click(screen.getByText('Last model input · ~50%'))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Preservation note (optional)' }), { target: { value: 'Preserve the migration decisions' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Compact now' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === '/api/sessions/a/compact')).toBe(true))
+    const request = fetchMock.mock.calls.find(([path]) => path === '/api/sessions/a/compact')!
+    expect(request[1]?.method).toBe('POST')
+    expect(JSON.parse(request[1]!.body as string)).toEqual({ preservation_note: 'Preserve the migration decisions' })
+    act(() => socket.emit({ type: 'status', status: 'compacting' }))
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Compact now' }).disabled).toBe(true)
+    expect(screen.getByRole('button', { name: 'Stop response' })).toBeTruthy()
+    act(() => {
+      socket.emit({ type: 'context', context_info: { ...contextInfo, prepared_for_next_turn: true, compactions: 2 } })
+      socket.emit({ type: 'status', status: 'idle' })
+    })
+    expect(screen.getByText('Context preview · ~50%')).toBeTruthy()
+    await waitFor(() => expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Compact now' }).disabled).toBe(false))
+  })
+
   it('keeps one composer after creating a conversation and switching away and back', async () => {
     await renderApp()
     fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Start a conversation' } })
@@ -440,15 +587,15 @@ describe('context budget', () => {
     const meter = screen.getByRole('progressbar', { name: 'Estimated model input usage' })
     expect(meter.getAttribute('aria-valuetext')).toBe('Approximately 50% of input budget')
     fireEvent.click(screen.getByText('Last model input · ~50%'))
-    expect(screen.getByText('Approximately 12,000 of 24,000 input tokens used.')).toBeTruthy()
-    expect(screen.getByText(/Conservative UTF-8 estimate, not a provider token count/)).toBeTruthy()
+    expect(screen.getByText('Approximately 60,380 of 120,760 input tokens used.')).toBeTruthy()
+    expect(screen.getByText(/Heuristic text-size estimate, not a provider token count or billing usage/)).toBeTruthy()
     expect(screen.getByText(/Estimate for the last request; updates each model call/)).toBeTruthy()
-    expect(screen.getByText(/8,192 tokens are reserved for the response and 576 for safety/)).toBeTruthy()
+    expect(screen.getByText(/8,192 tokens are reserved for the response and 2,048 for safety/)).toBeTruthy()
     expect(screen.getByText('Compactions: 1. Messages summarized: 8.')).toBeTruthy()
     expect(screen.getByText('AGENTS.md')).toBeTruthy()
     expect(screen.getByText('src/AGENTS.md')).toBeTruthy()
     expect(screen.getByText('Project instructions were truncated.')).toBeTruthy()
-    act(() => firstSocket.emit({ type: 'context', context_info: { ...contextInfo, estimated_tokens: 18000, compactions: 2 } }))
+    act(() => firstSocket.emit({ type: 'context', context_info: { ...contextInfo, estimated_tokens: 90570, compactions: 2 } }))
     expect(screen.getByText('Last model input · ~75%')).toBeTruthy()
     expect(screen.getByText('· 2 compactions')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /^Empty conversation/ }))
@@ -457,6 +604,23 @@ describe('context budget', () => {
     expect(screen.getByText('Context usage is estimated after the first turn.')).toBeTruthy()
     expect(screen.queryByRole('progressbar', { name: 'Estimated model input usage' })).toBeNull()
     expect(screen.queryByText('AGENTS.md')).toBeNull()
+  })
+
+  it('does not present saved byte-based context estimates as token usage', async () => {
+    sessions.set('a', { ...makeSession('a', 'Other conversation'), context_info: {
+      ...contextInfo, estimate_method: 'conservative_utf8',
+    } })
+    await renderApp()
+    fireEvent.click(screen.getByRole('button', { name: /^Other conversation/ }))
+    const socket = await showSession('a')
+    fireEvent.click(screen.getByText('Last model input · estimate outdated'))
+    expect(screen.queryByRole('progressbar', { name: 'Estimated model input usage' })).toBeNull()
+    expect(screen.getByText(/The saved meter counted bytes as tokens/)).toBeTruthy()
+    expect(screen.getByText(/Increasing the context budget does not increase the response limit/)).toBeTruthy()
+    act(() => socket.emit({ type: 'context', context_info: contextInfo }))
+    expect(screen.getByText('Last model input · ~50%')).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Estimated model input usage' })).toBeTruthy()
+    expect(screen.queryByText(/The saved meter counted bytes as tokens/)).toBeNull()
   })
 
   it('updates active and sidebar context without replacing events and ignores abandoned sockets', async () => {

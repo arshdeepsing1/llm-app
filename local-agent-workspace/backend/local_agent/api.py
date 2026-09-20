@@ -19,10 +19,15 @@ from .store import Store
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
 from .feature_api import register_features
+from .portability_api import register_portability
 
 
 class Prompt(BaseModel):
     text: str = Field(min_length=1, max_length=50000)
+
+
+class CompactionRequest(BaseModel):
+    preservation_note: str = Field(default="", max_length=1000, strict=True)
 
 
 class Decision(BaseModel):
@@ -35,6 +40,10 @@ class SessionPermissions(BaseModel):
 
 class SessionModel(BaseModel):
     model: str = Field(min_length=1, max_length=256, strict=True)
+
+
+class SessionTitle(BaseModel):
+    title: str = Field(min_length=1, max_length=160, strict=True)
 
 
 class FolderAccess(BaseModel):
@@ -201,6 +210,21 @@ def create_app(settings=None):
         await manager.broadcast(session_id, {"type": "model", "model": model})
         return result
 
+    @app.put("/api/sessions/{session_id}/title")
+    async def rename_session(session_id: str, body: SessionTitle):
+        session = session_or_404(session_id)
+        title = " ".join(body.title.split())
+        if not title or any(ord(char) < 32 or ord(char) == 127 for char in title):
+            raise ValueError("Enter a conversation title without control characters.")
+        # Persist first so a failed save cannot change a running conversation.
+        # The existing flag also prevents an in-flight generated title replacing
+        # the user's choice, even when they keep the previous title unchanged.
+        updated = {**session, "title": title, "title_generated": True}
+        store.save(updated)
+        session.update(title=title, title_generated=True, updated=updated["updated"])
+        await manager.broadcast(session_id, {"type": "title", "title": title})
+        return public_session(session, manager.statuses.get(session_id, "idle"))
+
     @app.post("/api/sessions/{session_id}/folders")
     async def allow_folder(session_id: str, body: FolderAccess):
         session = session_or_404(session_id)
@@ -259,6 +283,14 @@ def create_app(settings=None):
     async def stop(session_id: str):
         session_or_404(session_id)
         await manager.stop(session_id)
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/compact", status_code=202)
+    async def compact(session_id: str, body: CompactionRequest):
+        session_or_404(session_id)
+        if manager.statuses.get(session_id, "idle") != "idle" or (session_id in manager.tasks and not manager.tasks[session_id].done()):
+            raise HTTPException(409, "Stop the current response before compacting context.")
+        manager.start_compaction(session_id, body.preservation_note)
         return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/approvals/{event_id}")
@@ -360,6 +392,7 @@ def create_app(settings=None):
         return await manager.jobs.stop(job_id)
 
     register_features(app, manager, settings, store, session_or_404, workspace_tools)
+    register_portability(app, manager, settings, store, session_or_404)
 
     dist = APP_ROOT / "frontend" / "dist"
     if (dist / "assets").is_dir():

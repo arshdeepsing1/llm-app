@@ -16,6 +16,8 @@ The application is self-contained in this folder, with a Python backend and Reac
 - Managed background jobs with explicit Stop, output retrieval, status/history,
   per-command time/output limits, and cleanup on normal server shutdown.
 - Resume conversations after refreshing or restarting the app.
+- Periodic partial-reply checkpoints, safe JSON conversation export/import, and
+  completed-conversation forks with fresh permissions.
 - Configurable context budgeting, automatic summaries of older turns, and a visible
   context meter. Full conversation history stays on disk.
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
@@ -116,14 +118,50 @@ The committed `frontend/dist` runs with Python and its runtime dependencies only
 (`python -m pip install -c constraints.txt -e ./backend`). Node and pnpm are needed
 only when changing, rebuilding, or developing the frontend.
 Git and a supported shell are still needed for their respective tools.
-The backend installation automatically installs FastAPI, Uvicorn, HTTPX, regex,
+The backend installation automatically installs FastAPI, Uvicorn, HTTPX, regex, jsonschema,
 MCP (`mcp==2.2.0`), and the MCP HTTP transport dependency HTTPX2. No Claude SDK,
 Claude CLI, or sibling SDK checkout is required. An optional MCP server may have
 its own runtime requirements, such as Node; install those only for the servers you choose.
 
-To move chat history, stop both servers and copy `.local/conversations.sqlite3`.
-Existing conversations retain their absolute project paths and folder grants;
-start a new conversation if those paths differ on the destination laptop.
+To move selected chat history between machines, use **Agent tools → Conversation →
+Export conversation**, then import the JSON on the other machine and explicitly
+choose its local project folder. Imports receive fresh IDs, Manual permissions,
+no folder grants, and no active skills; they never overwrite existing conversations.
+For a full database backup, stop both servers before copying
+`.local/conversations.sqlite3`. A database copy retains absolute paths and grants,
+unlike the safer selected-conversation import.
+
+### Conversation durability and copies
+
+Streamed assistant text and reported usage are checkpointed after 16 KiB of new
+content or one second of dirty state, including when the provider stalls. Normal
+completion and Stop flush the final state. After an abrupt process death, the last
+saved partial reply is shown as interrupted; the most recent uncheckpointed text
+may be lost. Incomplete streamed tool arguments are never persisted as executable
+requests or replayed. A local storage failure stops the response and reports that
+recent history may not have been saved. SQLite backups remain important.
+
+**Agent tools → Conversation** exports a versioned JSON bundle, optionally with
+subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
+Imports preserve historical messages, tool results, summaries, and usage, remap
+conversation/event/call IDs and included child links, and cancel historical active
+states. Credential settings, hooks/MCP configuration, task-board records, jobs, file checkpoint ownership,
+and folder grants are not transferred. Conversation text can itself contain sensitive
+data: inspect exported files before sharing them. Choose a trusted bundle and an
+existing destination folder; imported paths never select the destination for you.
+Repeated imports intentionally create separate copies. Unsupported versions, malformed
+history, oversized bundles, and authority-bearing fields are rejected atomically.
+
+**Fork completed conversation** makes a separate full-history copy in the same
+workspace, leaving the original unchanged. Only completed, idle conversations can
+be forked; running/failed turns and arbitrary turn selection are not supported.
+Forks also start in Manual with no folder grants or active skills, retain any tool
+profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
+
+The sidebar now reads a separate small SQLite metadata table instead of loading
+every transcript. Existing databases are backfilled once, and summary rows update
+transactionally with conversation saves, imports, and deletion. Transcript content
+is still loaded when opening a conversation or performing restart recovery.
 
 ## Working with the app
 
@@ -153,6 +191,11 @@ start a new conversation if those paths differ on the destination laptop.
   it, the temporary title stays and naming can retry after a later successful reply.
   Older automatically named chats are eligible when resumed; custom and worktree
   titles are preserved.
+  Use the pencil beside a sidebar conversation to rename it (up to 160 characters).
+  **Save name** or Enter saves; **Cancel rename** or Escape discards the edit.
+  Renaming also works during a response and does not change its history, model,
+  permissions, or selected conversation. Manual titles persist after restart and
+  are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
   the plus button to reference the file in chat. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,
@@ -171,6 +214,15 @@ start a new conversation if those paths differ on the destination laptop.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
   approval expires after five minutes; a browser refresh retains it while the server runs.
+- **Tool details**: task cards show their names and task status. A completed create/update
+  action does not mean the task itself is finished. Expand command cards to see the
+  full command (including inline Python), options, and output separately.
+- **Request details**: expand the details below an assistant response or tool-only
+  model request to inspect its endpoint, completion status, stop reason, and
+  provider-reported token usage when available. Failed requests distinguish invalid
+  requests, rate limits, output limits, network failures, and other error categories;
+  an HTTP status is shown when returned. Interrupted requests remain distinguishable
+  after restart, and older conversations without metadata still display normally.
 - **Other folders**: ask, for example, `Are there any CSV files in
   /Users/sagarsingh/Downloads?`. The agent can list, read and search absolute or `~/`
   paths. The first file-tool request outside the project opens a folder-access card.
@@ -225,18 +277,65 @@ Project files are shared on disk when chats select the same workspace; starting 
 new chat does not copy or isolate the project filesystem. Stop the server before
 copying the database for migration so SQLite's live WAL files are settled.
 
+### Provider-reported usage
+
+Request details retain the latest valid usage snapshot returned for each streamed
+chat-model request: input, output, total, cache read/write, and reasoning tokens
+when supplied. Repeated stream snapshots are not added together. Missing fields
+are unavailable, not zero; a reported zero is retained. Usage received before an
+interruption may be partial, not a final count. The app does not estimate missing
+provider usage, infer monetary cost, or retry inference to obtain usage.
+
+These are per-request records, not account-wide usage or a billing report. They
+exclude automatic conversation-title and context-summary requests; a delegated
+child's requests are recorded in its own conversation. Databricks streaming
+responses may omit usage. Existing chats cannot acquire usage retroactively.
+See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
+for the provider's usage fields. The context meter below remains a separate
+pre-request estimate even when reported usage is available.
+
 ### Context and project instructions
 
-**Settings → Context budget (tokens)** defaults to 32,768. Set it at or below your
-endpoint's actual context limit; the app cannot infer a serving endpoint's limit
-from its name. Changes apply on the next turn, including existing conversations.
-Each request reserves 8,192 tokens for the reply and 2,048 for provider overhead.
-The meter estimates the last prepared model input using serialized UTF-8 byte
-counts plus framing overhead. This deliberately conservative estimate can compact
-earlier than a model tokenizer would; it is not provider usage or billing data.
+**Settings → Context budget (tokens)** defaults to 131,000 for new or previously
+unset settings. Explicit saved values, including 32,768 and 131,000, are preserved.
+The allowed range is 16,384–1,048,576; these are app configuration bounds, not a
+claim that every endpoint supports that range or the default. Set the budget at
+or below your endpoint's actual total context limit; the app cannot infer a
+serving endpoint's limit from its name. Changes apply on the next turn, including
+existing conversations. The configured total includes space for both input and
+reply: each request reserves 8,192 tokens for the reply and a 2,048-token safety
+margin, leaving an estimated input budget of 120,760 at the new default.
+The meter estimates the last prepared model input using roughly one token per
+three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
+overhead. This heuristic varies from the actual model tokenizer and is not a
+guaranteed upper bound, provider usage, or billing data. Older saved byte-based
+meters refresh on the next request.
+Expanded context details attribute that same estimate to system/project
+instructions (including selected skills), tool definitions, conversation messages
+and tool results, the retained summary, and request framing/rounding overhead.
+The categories add up to the displayed estimate; they are not tokenizer-derived
+measurements. Automatic compaction is attempted when the estimate exceeds the
+input budget, after the reply and safety reserves have been deducted.
+
+The 8,192-token response limit is separate from the configurable total context
+capacity and the resulting input budget.
+Increasing the context budget does not increase the response limit. If a response
+is truncated or contains malformed tool arguments, none of that response's tool
+calls run. Send a follow-up asking for smaller steps. Existing malformed tool
+exchanges are excluded from subsequent model requests while their original
+history and recorded outcomes remain saved; the conversation can resume without
+deleting it. This does not guarantee that the model can finish any size of output
+in one response.
+Incoming SSE events are capped at 1 MiB and accumulated tool arguments at 512 KiB
+per response, across at most 64 calls. Oversized or unfinished frames fail before
+any tool in that response executes; the error is recorded without saving broken
+tool calls into model history.
 
 When older turns no longer fit, the same endpoint summarizes them in bounded
-requests. The newest turn and its complete tool exchanges are retained verbatim;
+requests with at most 1,024 output tokens per summary request. The retained summary
+must also fit within 3,500 UTF-8 bytes; that byte cap is not a token count. These
+summary limits are separate from the main reply limit and total context budget.
+The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
 in SQLite. Summary requests are additional billed inference. A failed or stopped
@@ -245,8 +344,16 @@ can lose details; they are not an exact substitute for the original transcript.
 If the latest turn, tool output, or project guidance alone is too large, the app
 reports an error instead of silently cutting it. Increase the budget only within
 your endpoint's limit, or start a new conversation with a smaller request. There
-is no manual `/compact` command or model tokenizer integration. Retained job output
-is paginated; discarded process output cannot be recovered.
+is no model tokenizer integration. Retained job output is paginated; discarded
+process output cannot be recovered.
+
+Expand the context meter and choose **Compact now** while the conversation is
+idle to summarize earlier turns before reaching the automatic threshold. An
+optional preservation note highlights decisions or details to keep. This uses
+additional model inference and can be cancelled with **Stop**. It does not run
+tools, connect MCP servers, or rewrite the archived conversation. The resulting
+**Context preview** uses the last saved tool definitions (built-ins only for
+older sessions without that snapshot); definitions may change on the next turn.
 
 At each model request the app rereads root `AGENTS.md`, then `CLAUDE.md`. File tools
 also discover guidance in the target directory and its ancestors, from broader
@@ -264,7 +371,9 @@ deferred until a new model request includes it. Guidance is checked again after
 approval. The combined wrapped guidance is limited to 16,000 UTF-8 bytes; unreadable,
 excluded, or oversized files are omitted whole, with warnings in the model input
 and expandable context details. Warnings do not permanently block subsequent
-actions. Context details list loaded filenames, compactions, and estimated usage.
+actions. Context details list instruction filenames, directory scopes, estimated
+per-file contributions, and omission reasons. File contributions are already part
+of the system-instruction estimate; do not add them again to the overall total.
 
 ### Agent tools: recovery and worktrees
 
@@ -276,6 +385,12 @@ A restore creates a reverse checkpoint, so it can be undone. Restoring creation
 of a new file removes that file. Stop active workspace turns and commands first.
 Checkpoints belong to the conversation (or the default-workspace scope for saves
 before a chat exists). Deleting a conversation deletes its checkpoint copies.
+New model-driven edits record their originating user turn. **Preview turn** shows
+that turn's individual checkpoints, newest first, in pages of ten. Each file still
+requires its own explicit restore and current-state validation; this is not an
+atomic whole-turn undo. Earlier edits to the same file may no longer be restorable.
+Manual editor saves, reverse checkpoints, and older unassociated records remain
+under **Other file edits**.
 
 Recovery covers regular UTF-8 files up to 80 KB. It preserves existing bytes and
 permissions, uses atomic replacement, and pins directories during writes. It does
@@ -303,6 +418,11 @@ connects and lists tools without model inference. Servers can run over stdio
 script paths. Project files cannot automatically register or launch servers.
 No custom environment, authentication headers, OAuth, resource browsing, or MCP
 prompt workflow is implemented in this release. Keep credentials out of this JSON.
+The test reports each server independently as connected, failed (with a diagnostic),
+or disabled; disabled servers are not started. Results are a test snapshot, not a
+persistent live-health monitor. Failed test connections cannot contribute stale tools.
+Each server is tested independently; a collection of individually healthy servers
+must still fit the aggregate tool/schema limits when a chat starts.
 
 ```json
 {
@@ -311,7 +431,7 @@ prompt workflow is implemented in this release. Keep credentials out of this JSO
      "command": "/absolute/path/to/server", "args": [], "enabled": false}
   ],
   "hooks": [
-    {"id": "check", "event": "before_tool", "command": "your-check-command",
+    {"id": "check", "event": "before_tool", "tools": ["write_file", "edit_file"], "command": "your-check-command",
      "timeout_seconds": 10, "enabled": false}
   ]
 }
@@ -325,6 +445,9 @@ from local server/hook processes. Up to four servers, 32 tools, and 16 KB of too
 schemas are supported; each call has a 60-second deadline and bounded 8 KB result.
 Connections close at turn end or cancellation. A discovery failure is reported,
 not silently interpreted as an empty working integration.
+An MCP result with `is_error=true` is displayed as an error even when the server
+request itself succeeded. Its bounded diagnostic remains available to the model;
+the app does not automatically retry the action.
 
 Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Optional simple
 frontmatter supplies `name` and `description`. Enable a discovered skill in the
@@ -336,11 +459,25 @@ before a write, command, or MCP call. At most three selected skills fit a combin
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
 
-Hooks support `before_tool` and `after_tool`. Each enabled hook receives JSON on
-stdin with the event, conversation ID, tool, arguments, and (after execution) result.
+Tool arguments are validated against their advertised JSON Schema before approvals,
+hooks, or execution, then pass the existing semantic/path checks. Validation is
+offline and bounded: only local acyclic JSON pointers are supported; remote/dynamic
+references and patternProperties are rejected. Explicit dialects must be JSON Schema
+2020-12. Unsupported schemas produce a diagnostic instead of executing unvalidated
+input. Existing MCP schema/argument caps remain in force.
+
+Hooks support `before_tool`, `after_tool`, and `tool_failure`. Each enabled hook receives JSON on
+stdin with the event, conversation ID, tool, arguments, stable `call_id`, and (after execution) result.
+The optional `tools` array selects exact names (including MCP names); omit it for
+all tools, or use an empty array to match none. Failure hooks receive the original
+error/outcome for invoked tools that fail, including MCP `is_error` results. Schema,
+policy, and approval rejections and cancelled actions do not launch failure hooks.
+Foreground commands with failed/timed-out results also trigger failure hooks;
+background-job completion does not launch a deferred hook.
 Each hook separately asks for approval except in Bypass; Plan skips hooks. A declined
 or failing before-hook blocks the tool. An after-hook failure displays a warning
-while retaining the completed action/result. Hooks have a 1–30 second timeout and
+while retaining the completed action/result. Failure-hook errors also preserve the
+original error. Hooks have a 1–30 second timeout and
 bounded output. They do not recursively invoke hooks. Enable only commands you
 intend to run for every applicable tool; configuration can change only while agent
 turns are idle.
@@ -363,6 +500,24 @@ completed/failed/cancelled status. **Open subagent** opens the child to review i
 work or approve actions; **Back to parent conversation** returns to the parent.
 Stop cancels both parent and active child. This is bounded delegation, not a
 multi-agent team scheduler or automatic task assignment.
+The parent card links to its child immediately and updates live with approval
+waits, the last tool, completed-action count, and a structured stopping reason
+(completion, user Stop, step limit, inference/tool error, or interruption).
+Progress metadata does not copy child tool payloads into the parent's context.
+The child's first prompt is labeled **Delegated by parent conversation** and
+retains the spawning action ID; later human messages are not labeled delegated.
+Unfinished delegated runs are marked interrupted on restart rather than left running.
+
+**Tasks → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
+for future children while the parent is idle. The model may request a narrower
+`tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
+permits file listing/reading/search, skill discovery/selection, and task listing;
+file-editor additionally permits file writes/edits under normal approval rules.
+Both file-only profiles exclude shell commands, jobs, MCP startup/calls, hooks,
+task mutations, and further delegation. Restrictions persist on child continuation,
+imports, and forks. Existing children are unchanged by a new ceiling. These are
+server-enforced model-tool limits, not an OS sandbox or restrictions on the user's
+explicit editor/terminal actions.
 
 **Activity** collapses a list of actual tool actions and their states; existing
 approval cards remain usable independently. A separate **Provider reasoning
@@ -412,6 +567,12 @@ a regular UTF-8 file, reject lines over 128 KB, and return at most 8 KB of seria
 JSON per page. They can therefore inspect larger source files without loading
 those files into the editor. File reads, search results, and job-output pages have
 explicit continuation markers. The filesystem can change between pages.
+
+The agent's `list_files` returns `entries` in pages of at most 8 KB. Pass the
+returned `next_offset` with the same path, depth, and glob to continue. Discovery
+still stops at 300 matches per query; `listing_limit_reached` indicates that the
+folder or glob should be narrowed to find additional files. The file explorer's
+existing listing API is unchanged.
 
 `search_files` supports literal search by default, `regex=true`, `case_sensitive`,
 `context_lines` (0–5), `offset` (0–10,000), and `max_results` (1–100, default 50).
@@ -492,8 +653,12 @@ bundle after starting the backend, restart the backend to register static assets
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/permissions.py`: shared mode rules and model instructions.
 - `backend/local_agent/store.py`: SQLite conversation storage.
+- `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
+- `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
+- `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
+- `backend/local_agent/telemetry.py`: validated provider usage and inference failure categories.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.

@@ -47,6 +47,7 @@ def stream(content=None, call=None):
 
 async def test_agent_write_creates_checkpoint_only_after_approval(runtime):
     manager, session, project, tools = runtime
+    turn = await manager.event(session, 'user', text='Update the note')
     (project / 'note.txt').write_text('before')
     session['permission_mode'] = 'manual'
     async def refuse(*args):
@@ -58,9 +59,34 @@ async def test_agent_write_creates_checkpoint_only_after_approval(runtime):
     session['permission_mode'] = 'acceptEdits'
     await manager.execute_tool(session, tools, 'write_file', {'path': 'note.txt', 'content': 'after'}, 'accepted')
     checkpoint = manager.checkpoints.list(session['id'])[0]
+    assert checkpoint['turn_id'] == turn['id']
     preview = manager.checkpoints.preview(checkpoint['id'], tools, session['id'])
     manager.checkpoints.restore(checkpoint['id'], tools, preview['expected_current_hash'], session['id'])
     assert (project / 'note.txt').read_text() == 'before'
+
+
+@pytest.mark.parametrize('is_error', [True, False])
+async def test_mcp_result_outcome_is_visible_without_retry_or_losing_model_output(runtime, is_error):
+    manager, session, _, tools = runtime
+    session['permission_mode'] = 'bypassPermissions'
+    calls = []
+
+    class Connection:
+        tool_names = {'mcp__demo__outcome'}
+        definitions = [{'function': {'name': 'mcp__demo__outcome', 'parameters': {'type': 'object'}}}]
+
+        async def call(self, name, args):
+            calls.append(name)
+            return {'output': 'Useful diagnostic', 'is_error': is_error, 'truncated': False}
+
+    manager.extension_connections[session['id']] = Connection()
+    result = await manager.execute_tool(session, tools, 'mcp__demo__outcome', {}, 'outcome-call')
+    assert calls == ['mcp__demo__outcome']
+    assert json.loads(result)['is_error'] is is_error
+    assert json.loads(result)['output'] == 'Useful diagnostic'
+    event = session['events'][-1]
+    assert event['state'] == ('error' if is_error else 'completed')
+    assert manager.store.get(session['id'])['events'][-1] == event
 
 
 @pytest.mark.parametrize('mode,approved,expected', [('manual', False, 0), ('manual', True, 1), ('bypassPermissions', False, 1), ('plan', True, 0)])
@@ -70,6 +96,7 @@ async def test_mcp_uses_policy_and_live_turn_connection(runtime, mode, approved,
     called = []
     class Connection:
         tool_names = {'mcp__demo__echo'}
+        definitions = [{'function': {'name': 'mcp__demo__echo', 'parameters': {'type': 'object'}}}]
         async def call(self, name, args):
             called.append(args)
             return {'ok': True}
@@ -86,9 +113,10 @@ async def test_mcp_connection_same_task_and_tools_sent(runtime, monkeypatch):
     manager, session, _, _ = runtime
     owner, calls = [], []
     class Connection:
+        definitions = [{'type': 'function', 'function': {'name': 'mcp__demo__echo', 'description': 'echo', 'parameters': {'type': 'object', 'properties': {}}}}]
         async def discover(self):
             assert asyncio.current_task() == owner[0]
-            return [{'type': 'function', 'function': {'name': 'mcp__demo__echo', 'description': 'echo', 'parameters': {'type': 'object', 'properties': {}}}}]
+            return self.definitions
         async def call(self, name, args):
             assert asyncio.current_task() == owner[0]
             calls.append(name)

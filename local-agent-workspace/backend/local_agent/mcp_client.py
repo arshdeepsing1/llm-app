@@ -13,6 +13,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
 from .jobs import ENVIRONMENT_KEYS
+from .tool_schema import validate_arguments, validate_schema
 
 CONNECT_TIMEOUT = 15
 CALL_TIMEOUT = 60
@@ -61,7 +62,9 @@ class MCPConnection:
         self.stack = AsyncExitStack()
         self.registry = {}
         self.definitions = []
+        self.tool_names = set()
         self._discovered = False
+        self._unavailable = False
 
     async def __aenter__(self):
         await self.stack.__aenter__()
@@ -71,10 +74,18 @@ class MCPConnection:
         # Preserve a caller's error instead of wrapping it in the transports'
         # nested task-group ExceptionGroups; resource cleanup still runs here,
         # on the same task that opened the SDK contexts.
-        await self.stack.aclose()
+        try:
+            await self.stack.aclose()
+        finally:
+            self.registry.clear()
+            self.definitions.clear()
+            self.tool_names.clear()
+            self._unavailable = True
         return False
 
     async def discover(self):
+        if self._unavailable:
+            raise ValueError("MCP discovery failed or this turn has closed; start a new turn before using its tools.")
         if self._discovered:
             return copy.deepcopy(self.definitions)
         for server in self.servers:
@@ -105,10 +116,12 @@ class MCPConnection:
                             definition = {"type": "function", "function": {"name": name,
                                 "description": f"External MCP tool from {server['name']}: {tool.description or tool.name}",
                                 "parameters": tool.input_schema}}
+                            validate_schema(tool.input_schema)
                             candidate = [*self.definitions, definition]
                             if len(candidate) > MAX_TOOLS or len(json.dumps(candidate).encode()) > MAX_DEFINITION_BYTES:
                                 raise ValueError("MCP discovery exceeds 32 tools or 16 KB of tool definitions; enable fewer servers/tools.")
-                            self.registry[name] = {"server_id": server["id"], "tool_name": tool.name, "session": session}
+                            self.registry[name] = {"server_id": server["id"], "tool_name": tool.name, "session": session,
+                                                   "schema": copy.deepcopy(tool.input_schema)}
                             self.definitions.append(definition)
                         cursor = page.next_cursor
                         if not cursor:
@@ -116,19 +129,27 @@ class MCPConnection:
                         if cursor in seen_cursors:
                             raise ValueError("MCP server repeated its tool-list cursor.")
                         seen_cursors.add(cursor)
-            except Exception as error:
+            except (Exception, asyncio.CancelledError) as error:
+                self.registry.clear()
+                self.definitions.clear()
+                self.tool_names.clear()
+                self._unavailable = True
+                if isinstance(error, asyncio.CancelledError):
+                    raise
                 raise ValueError(bounded_error(self.redact(f"MCP server {server['id']} could not connect or list tools: {error}"))) from error
         self._discovered = True
+        self.tool_names = set(self.registry)
         return copy.deepcopy(self.definitions)
 
     async def call(self, name, arguments):
+        if self._unavailable:
+            raise ValueError("MCP connection is no longer available in this turn.")
         if not self._discovered:
             await self.discover()
         tool = self.registry.get(name)
         if tool is None:
             raise ValueError("MCP tool is not available in this turn's configured servers.")
-        if not isinstance(arguments, dict) or len(json.dumps(arguments).encode()) > 32_000:
-            raise ValueError("MCP arguments must be a JSON object of at most 32 KB.")
+        validate_arguments(tool["schema"], arguments, limit=32_000)
         try:
             async with asyncio.timeout(CALL_TIMEOUT):
                 result = await tool["session"].call_tool(tool["tool_name"], arguments=arguments,
