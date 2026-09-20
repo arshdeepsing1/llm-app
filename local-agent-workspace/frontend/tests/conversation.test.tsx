@@ -8,8 +8,11 @@ const makeSession = (events: AgentEvent[], overrides: Partial<Session> = {}): Se
   id: 'parent', title: 'Parent task', workspace: '/project', model: 'test-model', status: 'idle',
   events, updated: 1, permission_mode: 'manual', allowed_directories: [], ...overrides,
 })
-beforeEach(() => { Element.prototype.scrollIntoView = vi.fn() })
-afterEach(() => { cleanup(); vi.restoreAllMocks() })
+beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn().mockResolvedValue(undefined) } })
+})
+afterEach(() => { cleanup(); Reflect.deleteProperty(navigator, 'clipboard'); vi.restoreAllMocks() })
 
 it('updates compact child progress without expanding the delegation tool or exposing child contents', () => {
   const onSelectSession = vi.fn()
@@ -46,6 +49,25 @@ it('labels only the initial delegated prompt with provenance', () => {
   ], { id: 'child', parent_session_id: 'parent', is_subagent: true })} />)
   expect(screen.getAllByText('Delegated by parent conversation')).toHaveLength(1)
   expect(screen.getByText('Check one more thing').textContent).toBe('Check one more thing')
+})
+
+it('copies raw user and assistant text independently while preserving child navigation', async () => {
+  const onSelectSession = vi.fn()
+  const userText = 'Review this path:\n/project/file.ts'
+  const assistantText = 'I reviewed **the file**.'
+  render(<Conversation onError={vi.fn()} onSelectSession={onSelectSession} session={makeSession([
+    { id: 'user', type: 'user', text: userText, child_session_id: 'child' },
+    { id: 'empty-user', type: 'user', text: '' },
+    { id: 'reply', type: 'assistant', text: assistantText },
+  ])} />)
+  const writeText = vi.mocked(navigator.clipboard.writeText)
+  expect(screen.getAllByRole('button', { name: 'Copy message' })).toHaveLength(1)
+  fireEvent.click(screen.getByRole('button', { name: 'Copy message' }))
+  await waitFor(() => expect(writeText).toHaveBeenNthCalledWith(1, userText))
+  fireEvent.click(screen.getByRole('button', { name: 'Copy response' }))
+  await waitFor(() => expect(writeText).toHaveBeenNthCalledWith(2, assistantText))
+  fireEvent.click(screen.getByRole('button', { name: 'Open subagent' }))
+  expect(onSelectSession).toHaveBeenCalledWith('child')
 })
 
 it('keeps provider reasoning collapsed by default and expands it separately from the answer', () => {

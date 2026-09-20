@@ -21,7 +21,13 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <datalist id="settings-models">{connection?.models.map(m => <option key={m} value={m}>{modelLabel(m)}</option>)}</datalist>
         <label>Context budget (tokens)<input type="number" required min={16384} max={1048576} step={1}
           value={form.context_window || ''} onChange={e => setForm(current => ({ ...current, context_window: Number(e.target.value) }))} /></label>
-        <p className="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve 8,192 tokens for the reply and 2,048 for a safety margin; the remainder is the input budget. Input usage is estimated. Responses are limited separately to 8,192 tokens per model call; increasing this budget does not increase that limit. Applies on the next turn.</p>
+        <p className="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve the output budget below plus 2,048 tokens for safety; the remainder is the estimated input budget. Applies on the next turn.</p>
+        <label>Max output tokens per request<input type="number" required min={1024} max={131072} step={1}
+          value={form.max_output_tokens || ''} onChange={e => setForm(current => ({ ...current, max_output_tokens: Number(e.target.value) }))} /></label>
+        <p className="field-help">The endpoint must support this value. A larger response budget leaves less context for input and can increase usage.</p>
+        <label>Agent steps per message<input type="number" required min={1} max={64} step={1}
+          value={form.max_agent_steps || ''} onChange={e => setForm(current => ({ ...current, max_agent_steps: Number(e.target.value) }))} /></label>
+        <p className="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
         <label>Credential file<input value={form.env_file} onChange={e => field('env_file', e.target.value)} placeholder="/path/to/env_vars.txt" /></label>
         <p className="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>
         <p className="settings-note">Project and model changes apply to new conversations. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>

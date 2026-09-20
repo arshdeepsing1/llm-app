@@ -8,7 +8,11 @@ import httpx
 
 from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .permissions import BASIC_COMMANDS, COMMAND_TOOLS, mode_prompt, tool_decision
-from .context import prepare_context, build_summary_messages, SUMMARY_MAX_TOKENS, DEFAULT_CONTEXT_WINDOW, REPLY_RESERVE
+from .context import (
+    DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, SUMMARY_MAX_TOKENS,
+    build_summary_messages, prepare_context,
+)
+from .config import DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
 from .recovery import CheckpointManager
@@ -25,6 +29,19 @@ from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 
 
+MAX_OUTPUT_LIMIT_RETRIES = 2
+OUTPUT_LIMIT_HISTORY_PLACEHOLDER = (
+    "[The previous response reached the configured output-token limit. Its partial text was omitted from "
+    "model history, and none of its proposed tool calls ran.]"
+)
+OUTPUT_LIMIT_CONTINUATION = (
+    "Automatic continuation after an output cutoff: none of the previous response's proposed tool calls ran. "
+    "Continue the user's existing task, inspect current state before acting, and do not repeat completed side "
+    "effects. Split large writes and tool arguments into small, focused steps that fit comfortably within the "
+    "output limit."
+)
+
+
 SYSTEM_PROMPT = """You are Local, a practical coding assistant working in the user's selected workspace.
 Use the available tools to inspect actual files before describing or changing them.
 Complete the requested task; do not claim a tool ran unless its result confirms it.
@@ -39,9 +56,11 @@ Use list_jobs/get_job_output to inspect jobs and stop_job to terminate them. Bac
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
 Read files in numbered line ranges and follow next_line; paginate searches and job output
 instead of requesting huge results. A completed command can have a nonzero exit code: check it.
-Keep tool arguments small enough to finish in one response. Build large files in smaller
-edits instead of generating a whole large file in one tool call. After an interrupted
-response, review recorded results and inspect current files before continuing.
+Keep tool arguments small enough to finish in one response. Proactively split large file
+writes into a small initial file and focused follow-up edits; do not wait for an output
+cutoff before breaking up the work. Prefer one compact write or edit per response when
+generated content could be long. After an interrupted response, review recorded results
+and inspect current files before continuing.
 Use workspace-relative paths for project files, or absolute / ~/ paths for other folders.
 You CAN inspect folders outside the workspace, including Downloads. Call list_files
 with that path; the app requests folder access when needed. Never claim you cannot
@@ -802,6 +821,7 @@ class AgentManager:
                 _, updated, info = await prepare_context(
                     model_history(session["wire"]), state, system, definitions,
                     self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW), summarize,
+                    reply_reserve=self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
                     force_compact=True, preservation_note=preservation_note)
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True}
@@ -881,9 +901,10 @@ class AgentManager:
             arguments, error = [], None
             if finish == "length":
                 error = InferenceError(
-                    f"The model reached this response's {REPLY_RESERVE:,}-token output limit, which is separate "
-                    "from the context-window setting. No tool calls from this response ran. "
-                    "Ask it to continue in smaller steps, splitting large file writes.", "output_limit")
+                    f"The model reached this response's {payload['max_tokens']:,}-token output limit, which is "
+                    "separate from the context-window setting. No tool calls from this response ran.",
+                    "output_limit")
+                message["content"] = OUTPUT_LIMIT_HISTORY_PLACEHOLDER
             elif finish not in ("stop", "tool_calls") or (calls and finish != "tool_calls"):
                 error = InferenceError(
                     "The model response ended before completion. No tool calls from this response ran. "
@@ -898,7 +919,8 @@ class AgentManager:
             elif not event["text"]:
                 error = InferenceError("The model returned no response. Try another model in Settings.", "invalid_response")
             if error:
-                message["content"] = ((message["content"] or "") + "\n\n[" + str(error) + "]").strip()
+                if error.kind != "output_limit":
+                    message["content"] = ((message["content"] or "") + "\n\n[" + str(error) + "]").strip()
             elif calls:
                 message["tool_calls"] = ordered_calls
             session["wire"].append(message)
@@ -952,19 +974,28 @@ class AgentManager:
         session["wire"] = wire
         if "context_state" in session or context_state:
             session["context_state"] = context_state
+        # A cancellation or inference failure can leave the protocol-only retry
+        # prompt unanswered. Do not place the next real user prompt after it.
+        if wire and wire[-1] == {"role": "user", "content": OUTPUT_LIMIT_CONTINUATION}:
+            wire.pop()
+            self.store.save(session)
         wire.append({"role": "user", "content": prompt})
         context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
+        max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
             async def summarize(previous, chunk):
                 return await self.summarize_context(session, client, url, headers, previous, chunk)
 
-            steps = session.get("max_steps", 6) if session.get("is_subagent") else 16
-            for _ in range(steps):
+            steps = (session.get("max_steps", 6) if session.get("is_subagent")
+                     else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
+            consecutive_output_retries = 0
+            for step_index in range(steps):
                 system, guidance = self.context_inputs(session, tools, mode)
                 messages, next_context, info = await prepare_context(
-                    model_history(wire), context_state, system, definitions, context_window, summarize)
+                    model_history(wire), context_state, system, definitions, context_window, summarize,
+                    reply_reserve=max_output_tokens)
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"]}
@@ -974,13 +1005,41 @@ class AgentManager:
                 event = await self.event(session, "assistant", text="",
                                          request_info={"model": session["model"], "status": "running"})
                 payload = {"messages": messages,
-                           "tools": definitions, "stream": True, "max_tokens": REPLY_RESERVE}
-                ordered_calls, arguments = await self.model_response(session, event, client, url, headers, payload)
+                           "tools": definitions, "stream": True, "max_tokens": max_output_tokens}
+                try:
+                    ordered_calls, arguments = await self.model_response(session, event, client, url, headers, payload)
+                except InferenceError as exc:
+                    if exc.kind != "output_limit":
+                        raise
+                    has_another_step = step_index + 1 < steps
+                    if consecutive_output_retries < MAX_OUTPUT_LIMIT_RETRIES and has_another_step:
+                        consecutive_output_retries += 1
+                        wire.append({"role": "user", "content": OUTPUT_LIMIT_CONTINUATION})
+                        self.store.save(session)
+                        await self.event(
+                            session, "notice",
+                            text=(f"The response reached the {max_output_tokens:,}-token output limit; no tools "
+                                  f"from it ran. Automatically continuing in smaller steps "
+                                  f"({consecutive_output_retries} of {MAX_OUTPUT_LIMIT_RETRIES})."))
+                        continue
+                    if not has_another_step:
+                        detail = (f"The model reached the {max_output_tokens:,}-token output limit on the final "
+                                  f"configured model request ({steps}).")
+                    else:
+                        detail = (f"The model still reached the {max_output_tokens:,}-token output limit after "
+                                  "two automatic retries.")
+                    raise InferenceError(
+                        detail + " No tools from the last response ran. Raise Max output tokens or Agent steps "
+                        "in Settings if your endpoint supports it, or send a message to continue.",
+                        "output_limit", exc.http_status) from exc
                 if not ordered_calls:
                     return True
+                consecutive_output_retries = 0
                 for call, values in zip(ordered_calls, arguments):
                     output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"])
                     wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
                     self.store.save(session)
         await self.event(session, "error" if session.get("is_subagent") else "notice",
-                         text=f"Reached the {steps}-step limit. Send a message to continue.", terminal_reason="step_limit")
+                         text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
+                               "calls. Completed actions were kept. Increase Agent steps in Settings or send a "
+                               "message to continue."), terminal_reason="step_limit")

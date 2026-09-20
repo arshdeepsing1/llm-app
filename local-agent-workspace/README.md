@@ -296,15 +296,18 @@ pre-request estimate even when reported usage is available.
 
 ### Context and project instructions
 
-**Settings → Context budget (tokens)** defaults to 131,000 for new or previously
-unset settings. Explicit saved values, including 32,768 and 131,000, are preserved.
+**Settings → Context budget (tokens)** defaults to 131,072 for new or previously
+unset settings. Explicit saved values, including 32,768 and the former 131,000
+default, are preserved.
 The allowed range is 16,384–1,048,576; these are app configuration bounds, not a
 claim that every endpoint supports that range or the default. Set the budget at
 or below your endpoint's actual total context limit; the app cannot infer a
 serving endpoint's limit from its name. Changes apply on the next turn, including
 existing conversations. The configured total includes space for both input and
-reply: each request reserves 8,192 tokens for the reply and a 2,048-token safety
-margin, leaving an estimated input budget of 120,760 at the new default.
+reply. **Settings → Max output tokens** defaults to 8,192 and accepts
+1,024–131,072, but must be below the context budget minus the 2,048-token safety
+margin. The output setting is also the reply reserve, so the defaults leave an
+estimated input budget of 120,832 tokens.
 The meter estimates the last prepared model input using roughly one token per
 three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
 overhead. This heuristic varies from the actual model tokenizer and is not a
@@ -317,11 +320,19 @@ The categories add up to the displayed estimate; they are not tokenizer-derived
 measurements. Automatic compaction is attempted when the estimate exceeds the
 input budget, after the reply and safety reserves have been deducted.
 
-The 8,192-token response limit is separate from the configurable total context
-capacity and the resulting input budget.
-Increasing the context budget does not increase the response limit. If a response
-is truncated or contains malformed tool arguments, none of that response's tool
-calls run. Send a follow-up asking for smaller steps. Existing malformed tool
+The output-token limit is separate from the configurable total context capacity
+and the resulting input budget. Raising it reduces the available input budget and
+works only when the selected endpoint supports the requested value. If a response
+ends at that limit, none of that response's tool calls run. When another configured
+agent step is available, the app automatically retries in smaller steps up to twice;
+the full partial response remains in the visible event, while model history keeps a
+small omission marker and a hidden app-generated user continuation so role ordering
+survives later turns and restarts. The hidden continuation is not shown as a user chat
+event. If interruption leaves that internal continuation unanswered, the next real user
+turn removes it before sending the new prompt. A valid tool batch resets this
+consecutive-retry allowance. After two automatic retries, or when no configured step
+remains, the app stops with an explicit error so the limit cannot create an unbounded loop.
+Malformed tool arguments still stop immediately. Existing malformed tool
 exchanges are excluded from subsequent model requests while their original
 history and recorded outcomes remain saved; the conversation can resume without
 deleting it. This does not guarantee that the model can finish any size of output
@@ -559,8 +570,12 @@ directories remain excluded. This is a trusted single-user local app, not a mult
 Commands allowed by the selected mode execute with your OS permissions and can reach beyond the project.
 The shell strips model credentials from its inherited environment.
 
-The model agent allows up to 16 model steps per user turn and 8,192 output tokens per
-request. The editor and file edits retain their 80 KB limit. Agent reads use
+**Settings → Agent steps** defaults to 32 model requests per user message and accepts
+1–64. This is a model-request ceiling, not a tool-call count: one model response can
+request several tools. Reaching the ceiling preserves completed actions and stops
+until the user continues or raises the setting. **Max output tokens** defaults to
+8,192 per request with the bounds described above. The editor and file edits retain
+their 80 KB limit. Agent reads use
 `read_file(path, start_line=1, max_lines=200)` and return numbered lines plus
 `next_line`; `max_lines` can be 1–1,000. Reads scan at most 8 MB from the start of
 a regular UTF-8 file, reject lines over 128 KB, and return at most 8 KB of serialized
@@ -595,7 +610,7 @@ background mode instead of shell `&`, detached daemons, or commands that escape
 the process group. This is process supervision, not an OS sandbox. After an
 abnormal server death, previously running jobs are marked **interrupted** and
 never replayed; their outcome and surviving processes must be checked manually.
-Automatic compaction adds bounded summary requests beyond those 16 model steps.
+Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.
 

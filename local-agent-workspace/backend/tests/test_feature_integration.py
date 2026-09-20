@@ -235,7 +235,8 @@ async def test_child_budget_and_no_recursive_or_background_tools(runtime, monkey
     await manager.run(session, 'Inspect')
     assert len(count) == 2
     assert session['events'][-1]['type'] == 'error'
-    assert '2-step limit' in session['events'][-1]['text']
+    assert '2-request agent limit' in session['events'][-1]['text']
+    assert 'model requests, not tool calls' in session['events'][-1]['text']
     result = await manager.execute_tool(session, tools, 'run_command', {'command': 'true', 'background': True}, 'bg')
     assert 'cannot delegate or leave background' in result
     assert not manager.jobs.list()

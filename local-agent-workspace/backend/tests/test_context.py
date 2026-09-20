@@ -69,9 +69,10 @@ def test_empty_context_categories_are_zero_not_phantom_tokens():
     assert sum(breakdown.values()) == estimate_tokens([SYSTEM], [])
 
 
-async def test_large_ascii_request_fits_131000_context_without_premature_compaction():
+async def test_large_ascii_request_fits_default_context_without_premature_compaction():
     wire = [user("Read these files: " + "path/to/file.py\n" * 7000)]
-    messages, state, info = await prepare_context(wire, None, SYSTEM, TOOLS, 131000, forbidden_summary)
+    messages, state, info = await prepare_context(
+        wire, None, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, forbidden_summary)
     assert messages == [SYSTEM, *wire]
     assert state["compactions"] == 0
     assert info["estimated_tokens"] < info["input_budget"] * 0.4
@@ -96,6 +97,20 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
                     "context_window": DEFAULT_CONTEXT_WINDOW, "reply_reserve": REPLY_RESERVE,
                     "compactions": 0, "summarized_messages": 0, "estimate_method": "weighted_utf8",
                     "breakdown": context_breakdown(messages, TOOLS)}
+
+
+async def test_dynamic_reply_reserve_is_budgeted_without_mutating_wire():
+    wire = [user("Hello")]
+    original = copy.deepcopy(wire)
+    messages, state, info = await prepare_context(
+        wire, None, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, forbidden_summary,
+        reply_reserve=16384)
+    assert messages == [SYSTEM, *wire]
+    assert wire == original
+    assert state["through"] == 0
+    assert info["reply_reserve"] == 16384
+    assert info["input_budget"] == DEFAULT_CONTEXT_WINDOW - 16384 - SAFETY_MARGIN
+    assert info["estimated_tokens"] == estimate_tokens(messages, TOOLS)
 
 
 async def test_compaction_keeps_latest_two_turns_and_complete_tool_exchanges():
@@ -247,3 +262,12 @@ async def test_final_serialized_request_is_checked_before_committing_summary():
 async def test_invalid_context_window_is_rejected(context_window):
     with pytest.raises(ValueError, match="Choose a context window"):
         await prepare_context([user("Hello")], {}, SYSTEM, TOOLS, context_window, forbidden_summary)
+
+
+@pytest.mark.parametrize("reply_reserve", [
+    True, 1023, 131073, DEFAULT_CONTEXT_WINDOW - SAFETY_MARGIN,
+])
+async def test_invalid_reply_reserve_is_rejected(reply_reserve):
+    with pytest.raises(ValueError, match="output-token limit"):
+        await prepare_context([user("Hello")], {}, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW,
+                              forbidden_summary, reply_reserve=reply_reserve)

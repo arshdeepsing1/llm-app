@@ -65,6 +65,13 @@ export function useWorkspace() {
     setConnection(result)
     return result
   }, [])
+  const hasActiveSessions = sessions.some(item => item.status !== 'idle')
+
+  useEffect(() => {
+    if (!hasActiveSessions) return
+    const timer = setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
+    return () => clearInterval(timer)
+  }, [hasActiveSessions, refreshSessions])
 
   useEffect(() => {
     let mounted = true
@@ -149,7 +156,11 @@ export function useWorkspace() {
           ...current, events: current.events.map(e => e.id === data.id ? { ...e, text: (e.text || '') + data.text } : e),
         } : current)
         if (data.type === 'status') {
+          // Keep the sidebar current and prevent an older list response from
+          // replacing this newer streamed status.
+          sessionsRequest.current++
           setSession(current => current?.id === activeId ? { ...current, status: data.status } : current)
+          setSessions(current => current.map(item => item.id === activeId ? { ...item, status: data.status } : item))
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
         }
         if (data.type === 'title') {
@@ -199,8 +210,10 @@ export function useWorkspace() {
     await api(`/sessions/${id}/messages`, 'POST', { text })
   }
   const saveSettings = async (next: Settings) => {
-    const { workspace, model, env_file, context_window } = next
-    const saved = await api<Settings>('/settings', 'PUT', { workspace, model, env_file, context_window })
+    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps } = next
+    const saved = await api<Settings>('/settings', 'PUT', {
+      workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
+    })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
   }

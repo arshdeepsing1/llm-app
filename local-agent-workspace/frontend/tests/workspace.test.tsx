@@ -5,10 +5,11 @@ import { useWorkspace } from '../src/useWorkspace'
 import type { ContextInfo, Session, Settings } from '../src/types'
 
 const settings: Settings = {
-  workspace: '/project', model: 'test-model', env_file: '', context_window: 131000, host: '', configured: true,
+  workspace: '/project', model: 'test-model', env_file: '', context_window: 131072,
+  max_output_tokens: 8192, max_agent_steps: 32, host: '', configured: true,
 }
 const contextInfo: ContextInfo = {
-  estimated_tokens: 60380, input_budget: 120760, context_window: 131000, reply_reserve: 8192,
+  estimated_tokens: 60380, input_budget: 120832, context_window: 131072, reply_reserve: 8192,
   compactions: 1, summarized_messages: 8, estimate_method: 'weighted_utf8',
   instruction_files: ['AGENTS.md', 'src/AGENTS.md'], warnings: ['Project instructions were truncated.'],
 }
@@ -122,6 +123,49 @@ async function renderApp() {
   await waitFor(() => expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLSelectElement).value).toBe('test-model'))
 }
 
+describe('conversation activity', () => {
+  it('keeps the sidebar status in sync and ignores an older idle list response', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    await renderApp()
+    const stale = deferred<Response>()
+    const idleList = [...sessions.values()]
+    let delayNextList = true
+    override = path => {
+      if (path === '/api/sessions' && delayNextList) {
+        delayNextList = false
+        return stale.promise
+      }
+    }
+    const socket = await showSession('a')
+    const row = screen.getByRole('button', { name: /^Other conversation/ })
+    expect(row.querySelector('.activity-dot')).toBeNull()
+    act(() => socket.emit({ type: 'status', status: 'running' }))
+    expect(row.querySelector('.activity-dot')).toBeTruthy()
+    await act(async () => { stale.resolve(json(idleList)) })
+    expect(row.querySelector('.activity-dot')).toBeTruthy()
+    act(() => socket.emit({ type: 'status', status: 'idle' }))
+    await waitFor(() => expect(row.querySelector('.activity-dot')).toBeNull())
+  })
+
+  it('polls while a switched-away conversation is active and stops after it becomes idle', async () => {
+    window.history.replaceState(null, '', '/?session=a')
+    await renderApp()
+    const socket = await showSession('a')
+    await act(async () => { await Promise.resolve() })
+    vi.useFakeTimers()
+    act(() => socket.emit({ type: 'status', status: 'running' }))
+    const row = screen.getByRole('button', { name: /^Other conversation/ })
+    expect(row.querySelector('.activity-dot')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }))
+    sessions.set('a', { ...sessions.get('a')!, status: 'idle' })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+    expect(row.querySelector('.activity-dot')).toBeNull()
+    const completedPolls = fetchMock.mock.calls.filter(([path]) => path === '/api/sessions').length
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000) })
+    expect(fetchMock.mock.calls.filter(([path]) => path === '/api/sessions')).toHaveLength(completedPolls)
+  })
+})
+
 it('opens Databricks-only settings and saves only the editable Databricks fields', async () => {
   override = (path, options) => {
     if (path === '/api/bootstrap') return Promise.resolve(json({ token: 'test-token', settings: {
@@ -138,12 +182,20 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
   expect(dialog.getByLabelText('Databricks model endpoint')).toBeTruthy()
   expect(dialog.getByLabelText('Credential file')).toBeTruthy()
   const budget = dialog.getByLabelText<HTMLInputElement>('Context budget (tokens)')
-  expect(budget.value).toBe('131000')
+  expect(budget.value).toBe('131072')
   expect(budget.min).toBe('16384')
   expect(budget.max).toBe('1048576')
   expect(dialog.getByText(/Set at or below your endpoint's total context limit, not your account usage quota/)).toBeTruthy()
-  expect(dialog.getByText(/reserve 8,192 tokens for the reply and 2,048 for a safety margin/)).toBeTruthy()
-  expect(dialog.getByText(/Responses are limited separately to 8,192 tokens per model call/)).toBeTruthy()
+  expect(dialog.getByText(/reserve the output budget below plus 2,048 tokens for safety/)).toBeTruthy()
+  const output = dialog.getByLabelText<HTMLInputElement>('Max output tokens per request')
+  expect(output.value).toBe('8192')
+  expect(output.min).toBe('1024')
+  expect(output.max).toBe('131072')
+  const steps = dialog.getByLabelText<HTMLInputElement>('Agent steps per message')
+  expect(steps.value).toBe('32')
+  expect(steps.min).toBe('1')
+  expect(steps.max).toBe('64')
+  expect(dialog.getByText(/not individual tool calls/)).toBeTruthy()
   expect(dialog.queryByLabelText('Agent runtime')).toBeNull()
   expect(dialog.queryByText(/Claude|MCP|skills/i)).toBeNull()
   expect(dialog.queryByRole('checkbox')).toBeNull()
@@ -151,11 +203,14 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
   fireEvent.change(dialog.getByLabelText('Databricks model endpoint'), { target: { value: 'databricks-gpt-oss-120b' } })
   fireEvent.change(dialog.getByLabelText('Credential file'), { target: { value: '/credentials/env_vars.txt' } })
   fireEvent.change(budget, { target: { value: '65536' } })
+  fireEvent.change(output, { target: { value: '32768' } })
+  fireEvent.change(steps, { target: { value: '48' } })
   fireEvent.click(dialog.getByRole('button', { name: 'Save settings' }))
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
   const request = fetchMock.mock.calls.find(([path, options]) => path === '/api/settings' && options?.method === 'PUT')
   expect(JSON.parse(request![1]!.body as string)).toEqual({
-    workspace: '/updated-project', model: 'databricks-gpt-oss-120b', env_file: '/credentials/env_vars.txt', context_window: 65536,
+    workspace: '/updated-project', model: 'databricks-gpt-oss-120b', env_file: '/credentials/env_vars.txt',
+    context_window: 65536, max_output_tokens: 32768, max_agent_steps: 48,
   })
 })
 
@@ -458,7 +513,10 @@ describe('conversation models', () => {
     await act(async () => { pending.resolve(json(savedSettings)) })
     expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('other-model')
     const update = fetchMock.mock.calls.find(([path]) => path === '/api/settings')
-    expect(JSON.parse(update![1]!.body as string)).toEqual({ workspace: '/project', model: 'other-model', env_file: '', context_window: 131000 })
+    expect(JSON.parse(update![1]!.body as string)).toEqual({
+      workspace: '/project', model: 'other-model', env_file: '', context_window: 131072,
+      max_output_tokens: 8192, max_agent_steps: 32,
+    })
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
     await showSession('created')
     expect(sessions.get('created')?.model).toBe('other-model')
@@ -587,7 +645,7 @@ describe('context budget', () => {
     const meter = screen.getByRole('progressbar', { name: 'Estimated model input usage' })
     expect(meter.getAttribute('aria-valuetext')).toBe('Approximately 50% of input budget')
     fireEvent.click(screen.getByText('Last model input · ~50%'))
-    expect(screen.getByText('Approximately 60,380 of 120,760 input tokens used.')).toBeTruthy()
+    expect(screen.getByText('Approximately 60,380 of 120,832 input tokens used.')).toBeTruthy()
     expect(screen.getByText(/Heuristic text-size estimate, not a provider token count or billing usage/)).toBeTruthy()
     expect(screen.getByText(/Estimate for the last request; updates each model call/)).toBeTruthy()
     expect(screen.getByText(/8,192 tokens are reserved for the response and 2,048 for safety/)).toBeTruthy()

@@ -7,10 +7,13 @@ is neither a provider token count nor a guaranteed upper bound for every model.
 import json
 
 
-DEFAULT_CONTEXT_WINDOW = 131000
+DEFAULT_CONTEXT_WINDOW = 131072
 MIN_CONTEXT_WINDOW = 16384
 MAX_CONTEXT_WINDOW = 1048576
-REPLY_RESERVE = 8192
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
+MIN_MAX_OUTPUT_TOKENS = 1024
+MAX_MAX_OUTPUT_TOKENS = 131072
+REPLY_RESERVE = DEFAULT_MAX_OUTPUT_TOKENS
 SAFETY_MARGIN = 2048
 SUMMARY_MAX_TOKENS = 1024
 SUMMARY_MAX_BYTES = 3500
@@ -69,11 +72,15 @@ def build_summary_messages(previous, chunk, preservation_note=""):
 
 
 async def prepare_context(wire, state, system_message, tools, context_window, summarize,
-                          *, force_compact=False, preservation_note=""):
+                          *, reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS, force_compact=False,
+                          preservation_note=""):
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
+    if (type(reply_reserve) is not int or not MIN_MAX_OUTPUT_TOKENS <= reply_reserve <= MAX_MAX_OUTPUT_TOKENS
+            or reply_reserve >= context_window - SAFETY_MARGIN):
+        raise ValueError("Choose an output-token limit within the supported range and below the context window minus the safety margin.")
     state = {"summary": "", "through": 0, "compactions": 0, **(state or {})}
-    input_budget = context_window - REPLY_RESERVE - SAFETY_MARGIN
+    input_budget = context_window - reply_reserve - SAFETY_MARGIN
     messages = [system_message, *context_messages(wire, state)]
     estimate = estimate_tokens(messages, tools)
 
@@ -132,7 +139,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         state = updated
 
     info = {"estimated_tokens": estimate, "input_budget": input_budget, "context_window": context_window,
-            "reply_reserve": REPLY_RESERVE, "compactions": state["compactions"],
+            "reply_reserve": reply_reserve, "compactions": state["compactions"],
             "summarized_messages": state["through"], "estimate_method": "weighted_utf8",
             "breakdown": context_breakdown(messages, tools, bool(state["summary"]))}
     return messages, state, info

@@ -10,7 +10,7 @@ const info: ContextInfo = {
 }
 
 const contextInfo: ContextInfo = {
-  estimated_tokens: 6000, input_budget: 120760, context_window: 131000, reply_reserve: 8192,
+  estimated_tokens: 6000, input_budget: 120832, context_window: 131072, reply_reserve: 8192,
   compactions: 1, summarized_messages: 6, estimate_method: 'weighted_utf8', instruction_files: [], warnings: [],
 }
 
@@ -27,8 +27,8 @@ it('shows the approximate input breakdown and actual input-budget compaction thr
   for (const [label, value] of [['System instructions', '~1,000 tokens'], ['Tool definitions', '~2,000 tokens'], ['Messages and tool results', '~2,500 tokens'], ['Conversation summary', '~400 tokens'], ['Request overhead', '~100 tokens']]) {
     expect(screen.getByText(label).nextElementSibling?.textContent).toBe(value)
   }
-  expect(screen.getByText('Approximately 6,000 of 120,760 input tokens used.')).toBeTruthy()
-  expect(screen.getByText('Automatic compaction threshold: approximately 120,760 input tokens.')).toBeTruthy()
+  expect(screen.getByText('Approximately 6,000 of 120,832 input tokens used.')).toBeTruthy()
+  expect(screen.getByText('Automatic compaction threshold: approximately 120,832 input tokens.')).toBeTruthy()
   expect(screen.getByText('Compactions: 1. Messages summarized: 6.')).toBeTruthy()
 })
 
@@ -40,7 +40,7 @@ it('shows a zero-token summary and does not fabricate a breakdown for saved reco
   expect(screen.getByText('Conversation summary').nextElementSibling?.textContent).toBe('~0 tokens')
   view.rerender(<ContextMeter info={contextInfo} />)
   expect(screen.queryByText('Approximate input breakdown')).toBeNull()
-  expect(screen.getByText('Automatic compaction threshold: approximately 120,760 input tokens.')).toBeTruthy()
+  expect(screen.getByText('Automatic compaction threshold: approximately 120,832 input tokens.')).toBeTruthy()
 })
 
 it('keeps legacy byte estimates marked outdated instead of presenting an approximate breakdown', () => {

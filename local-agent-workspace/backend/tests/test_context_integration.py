@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
-from local_agent.context import estimate_tokens
+from local_agent.context import DEFAULT_CONTEXT_WINDOW, estimate_tokens
 from local_agent.store import Store
 
 
@@ -179,7 +179,7 @@ async def test_instruction_warnings_are_visible(runtime, monkeypatch):
     assert "AGENTS.md" in session["context_info"]["warnings"][0]
 
 
-@pytest.mark.parametrize("budget", [32768, 65536, 131000])
+@pytest.mark.parametrize("budget", [32768, 65536, DEFAULT_CONTEXT_WINDOW])
 def test_context_setting_validation_and_legacy_client(runtime, budget):
     manager, _, project = runtime
     settings = manager.settings
@@ -193,8 +193,33 @@ def test_context_setting_validation_and_legacy_client(runtime, budget):
         assert Settings(settings.state_dir).values["context_window"] == budget
 
 
+def test_output_and_agent_step_settings_are_bounded_and_persisted(runtime):
+    manager, _, project = runtime
+    settings = manager.settings
+    editable = {"workspace": str(project), "model": "test-model", "env_file": ""}
+    with TestClient(create_app(settings)) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        valid = {**editable, "context_window": 262144, "max_output_tokens": 131072, "max_agent_steps": 64}
+        response = client.put("/api/settings", headers=headers, json=valid)
+        assert response.status_code == 200
+        assert response.json()["max_output_tokens"] == 131072
+        assert response.json()["max_agent_steps"] == 64
+        for field, values in (("max_output_tokens", [True, 0, 131073, 8192.5, "8192"]),
+                              ("max_agent_steps", [True, 0, 65, 4.5, "32"])):
+            for invalid in values:
+                assert client.put("/api/settings", headers=headers,
+                                  json={**valid, field: invalid}).status_code == 422
+        too_close = {**valid, "context_window": 16384, "max_output_tokens": 14336}
+        response = client.put("/api/settings", headers=headers, json=too_close)
+        assert response.status_code == 400
+        assert "below the context budget" in response.json()["detail"]
+        persisted = Settings(settings.state_dir).values
+        assert persisted["max_output_tokens"] == 131072
+        assert persisted["max_agent_steps"] == 64
+
+
 @pytest.mark.parametrize("legacy_file", [False, True])
-def test_new_or_unset_context_settings_default_to_131000(tmp_path, monkeypatch, legacy_file):
+def test_new_or_unset_context_settings_use_default_context_window(tmp_path, monkeypatch, legacy_file):
     monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
     state = tmp_path / "state"
     editable = {"workspace": str(tmp_path), "model": "test-model", "env_file": ""}
@@ -202,9 +227,15 @@ def test_new_or_unset_context_settings_default_to_131000(tmp_path, monkeypatch, 
         state.mkdir()
         (state / "settings.json").write_text(json.dumps(editable))
     settings = Settings(state)
-    assert settings.values["context_window"] == 131000
-    assert settings.update(editable)["context_window"] == 131000
-    assert Settings(state).values["context_window"] == 131000
+    assert settings.values["context_window"] == DEFAULT_CONTEXT_WINDOW
+    assert settings.values["max_output_tokens"] == 8192
+    assert settings.values["max_agent_steps"] == 32
+    assert settings.update(editable)["context_window"] == DEFAULT_CONTEXT_WINDOW
+    assert settings.update(editable)["max_output_tokens"] == 8192
+    assert settings.update(editable)["max_agent_steps"] == 32
+    assert Settings(state).values["context_window"] == DEFAULT_CONTEXT_WINDOW
+    assert Settings(state).values["max_output_tokens"] == 8192
+    assert Settings(state).values["max_agent_steps"] == 32
 
 
 @pytest.mark.parametrize("budget", [32768, 131000])

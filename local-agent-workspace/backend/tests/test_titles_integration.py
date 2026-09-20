@@ -147,11 +147,16 @@ async def test_unsuccessful_turn_does_not_generate_title(runtime, monkeypatch, f
     mock_gateway(monkeypatch, gateway)
     await run_turn(manager, session["id"], "Inspect the project.")
     saved = manager.store.get(session["id"])
-    assert len(requests) == (16 if failure == "step_limit" else 1)
+    expected_requests = {"http_error": 1, "response_limit": 3, "step_limit": 32}[failure]
+    assert len(requests) == expected_requests
     assert all(request["stream"] for request in requests)
     assert saved["title"] == "Inspect the project."
     assert not saved.get("title_generated")
     assert saved["events"][-1]["type"] == ("notice" if failure == "step_limit" else "error")
+    if failure == "step_limit":
+        assert "model requests, not tool calls" in saved["events"][-1]["text"]
+    if failure == "response_limit":
+        assert "after two automatic retries" in saved["events"][-1]["text"]
     assert manager.statuses[session["id"]] == "idle"
 
 

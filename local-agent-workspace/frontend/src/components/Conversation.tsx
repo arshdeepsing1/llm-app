@@ -92,15 +92,19 @@ const ToolCard = memo(function ToolCard({ event, summary, sessionId, onError, on
   </div>
 })
 
-const Reply = memo(function Reply({ text, reasoning, truncated, requestInfo }: { text: string; reasoning?: string; truncated?: boolean; requestInfo?: RequestInfo }) {
+const CopyAction = memo(function CopyAction({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false)
+  return <button className="copy-button icon-button" aria-label={label} onClick={() => {
+    void navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) })
+  }}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>
+})
+
+const Reply = memo(function Reply({ text, reasoning, truncated, requestInfo }: { text: string; reasoning?: string; truncated?: boolean; requestInfo?: RequestInfo }) {
   return <div className="assistant-reply"><Brand small />
     <div className="reply-content">{reasoning ? <details className="reasoning-summary"><summary>Provider reasoning summary</summary>
       <p className="muted">Supplied by the model endpoint.</p><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reasoning}</ReactMarkdown></div>
       {truncated ? <p className="muted">Summary display limit reached.</p> : null}</details> : null}<div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
-      {text ? <button className="copy-button icon-button" aria-label="Copy response" onClick={() => {
-        void navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) })
-      }}>{copied ? <Check size={14} /> : <Copy size={14} />}</button> : null}
+      {text ? <CopyAction text={text} label="Copy response" /> : null}
       {requestInfo ? <RequestDetails info={requestInfo} /> : null}
     </div></div>
 })
@@ -126,7 +130,7 @@ export default function Conversation({ session, onError, onSelectSession }: { se
     </details> : null}
     {session.parent_session_id && onSelectSession ? <button className="outline parent-conversation" onClick={() => onSelectSession(session.parent_session_id!)}>Back to parent conversation</button> : null}
     {session.events.map(event => {
-      if (event.type === 'user') return <div className="user-message" key={event.id}>{event.origin?.kind === 'delegated' ? <small className="delegation-origin">Delegated by parent conversation</small> : null}{event.text}{event.child_session_id && onSelectSession ? <button className="outline" onClick={() => onSelectSession(event.child_session_id!)}>Open subagent</button> : null}</div>
+      if (event.type === 'user') return <div className="user-message" key={event.id}>{event.origin?.kind === 'delegated' ? <small className="delegation-origin">Delegated by parent conversation</small> : null}{event.text}{event.child_session_id && onSelectSession ? <button className="outline" onClick={() => onSelectSession(event.child_session_id!)}>Open subagent</button> : null}{event.text ? <CopyAction text={event.text} label="Copy message" /> : null}</div>
       if (event.type === 'tool') return <ToolCard key={event.id} event={event} summary={toolSummaries.get(event.id)!} sessionId={session.id} onError={onError} onSelectSession={onSelectSession} />
       if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? <Reply key={event.id} text={event.text || ''} reasoning={event.reasoning_summary} truncated={event.reasoning_truncated} requestInfo={event.request_info} /> : null
       return <div className={`conversation-notice ${event.type === 'error' ? 'error' : ''}`} key={event.id}>{event.text}<DelegationStatus event={event} onSelectSession={onSelectSession} />{!event.delegation && event.child_session_id && onSelectSession ? <button className="outline" onClick={() => onSelectSession(event.child_session_id!)}>Open subagent</button> : null}</div>
