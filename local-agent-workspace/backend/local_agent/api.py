@@ -20,6 +20,7 @@ from .context import (
 from .store import Store
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
+from .telemetry import session_metrics
 from .feature_api import register_features
 from .portability_api import register_portability
 
@@ -258,6 +259,10 @@ def create_app(settings=None):
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str):
         return public_session(session_or_404(session_id), manager.statuses.get(session_id, "idle"))
+
+    @app.get("/api/sessions/{session_id}/metrics")
+    async def get_session_metrics(session_id: str):
+        return session_metrics(session_or_404(session_id))
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str):

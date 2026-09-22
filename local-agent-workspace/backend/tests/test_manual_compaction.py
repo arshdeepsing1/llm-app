@@ -66,10 +66,16 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
     async def gateway(request):
         payload = json.loads(request.content)
         requests.append(payload)
+        call = manager.store.get(session["id"])["inference_calls"][-1]
+        assert call["purpose"] == "compaction" and call["status"] == "running"
         assert payload["stream"] is False and "tools" not in payload
         assert payload["max_tokens"] == SUMMARY_MAX_TOKENS
         assert "Preserve migration decisions" in payload["messages"][1]["content"]
-        return httpx.Response(200, json={"choices": [{"message": {"content": "Migration completed and must remain compatible."}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "Migration completed and must remain compatible."},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 16},
+        })
 
     def forbidden(*args, **kwargs):
         pytest.fail("Manual compaction must not execute tools or start MCP servers")
@@ -95,6 +101,9 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
     assert saved["context_state"]["through"] == 2
     assert saved["context_state"]["compactions"] == 3
     assert saved["context_info"]["prepared_for_next_turn"] is True
+    assert [(call["purpose"], call["status"], call["usage"])
+            for call in saved["inference_calls"]] == [
+                ("compaction", "completed", {"input_tokens": 120, "output_tokens": 16})]
     assert saved["context_info"]["instruction_sources"][0]["scope"] == "."
     assert (bool(saved["context_info"]["warnings"])) is not saved_definitions
     assert any(update.get("type") == "context" for update in updates)

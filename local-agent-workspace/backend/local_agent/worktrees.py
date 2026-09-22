@@ -127,8 +127,8 @@ class WorktreeManager:
             raise
 
     def _in_use(self, target):
-        for (data,) in self.store.db.execute("SELECT data FROM sessions"):
-            workspace = Path(json.loads(data)["workspace"]).expanduser().resolve()
+        for session in self.store.list():
+            workspace = Path(session["workspace"]).expanduser().resolve()
             if workspace.is_relative_to(target):
                 return True
         exists = self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()

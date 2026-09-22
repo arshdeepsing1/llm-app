@@ -3,6 +3,7 @@ import { X } from 'lucide-react'
 import { api } from '../api'
 import type { Session, ToolProfile } from '../types'
 import ConversationTransfer from './ConversationTransfer'
+import UsagePanel from './UsagePanel'
 
 type Props = { session: Session | null; workspace?: string; onClose: () => void; onSelectSession: (id: string) => void; onError: (message: string) => void }
 type Checkpoint = { id: string; path: string; created: number; status: string; turn_id?: string | null }
@@ -46,8 +47,8 @@ function AgentToolsScope(props: Props) {
   return <dialog className="agent-tools-dialog" ref={dialog} aria-label="Agent tools" onCancel={props.onClose} onClick={e => { if (e.target === dialog.current) props.onClose() }}>
     <div className="agent-tools-content">
       <header className="agent-tools-header"><div><h2>Agent tools</h2><p>{props.session?.title || 'Default workspace'}</p></div><button className="icon-button" aria-label="Close agent tools" onClick={props.onClose}><X size={18} /></button></header>
-      <nav className="agent-tools-tabs" aria-label="Agent tools sections">{['Recovery', 'Worktrees', 'Tasks', 'Extensions', 'Conversation'].map(name => <button key={name} aria-pressed={tab === name} onClick={() => setTab(name)}>{name}</button>)}</nav>
-      {tab === 'Recovery' ? <Recovery {...props} /> : tab === 'Worktrees' ? <Worktrees {...props} /> : tab === 'Tasks' ? <Tasks {...props} /> : tab === 'Extensions' ? <ExtensionsPanel {...props} /> :
+      <nav className="agent-tools-tabs" aria-label="Agent tools sections">{['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Extensions', 'Conversation'].map(name => <button key={name} aria-pressed={tab === name} onClick={() => setTab(name)}>{name}</button>)}</nav>
+      {tab === 'Recovery' ? <Recovery {...props} /> : tab === 'Usage' ? <UsagePanel session={props.session} onError={props.onError} /> : tab === 'Worktrees' ? <Worktrees {...props} /> : tab === 'Tasks' ? <Tasks {...props} /> : tab === 'Extensions' ? <ExtensionsPanel {...props} /> :
         <ConversationTransfer sessionId={props.session?.id} workspace={props.session?.workspace || props.workspace || ''} busy={!!props.session && props.session.status !== 'idle'} onError={props.onError} onSelectSession={id => { props.onSelectSession(id); props.onClose() }} />}
     </div>
   </dialog>

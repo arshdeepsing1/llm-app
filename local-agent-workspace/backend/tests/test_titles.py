@@ -78,6 +78,24 @@ async def test_request_uses_bounded_redacted_excerpts_and_selected_endpoint(setu
     assert json.dumps(session) == before
 
 
+async def test_recorded_title_call_preserves_provider_usage(setup, monkeypatch):
+    settings, session = setup
+    saves = []
+
+    async def gateway(request):
+        return httpx.Response(200, json={
+            "choices": [{"finish_reason": "stop", "message": {"content": "Fix login redirect"}}],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 5},
+        })
+
+    mock_gateway(monkeypatch, gateway)
+    assert await generate_title(settings, session, lambda value: saves.append(json.loads(json.dumps(value)))) == "Fix login redirect"
+    assert saves
+    call = session["inference_calls"][0]
+    assert call["purpose"] == "title" and call["status"] == "completed" and call["http_status"] == 200
+    assert call["usage"] == {"input_tokens": 42, "output_tokens": 5}
+
+
 @pytest.mark.parametrize("payload", [
     [], {}, {"choices": []}, {"choices": "invalid"}, {"choices": [None]},
     {"choices": [{"finish_reason": "stop", "message": None}]},

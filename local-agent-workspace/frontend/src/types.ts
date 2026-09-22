@@ -14,6 +14,27 @@ export type RequestInfo = {
     cache_read_input_tokens?: number; cache_creation_input_tokens?: number; reasoning_tokens?: number;
   };
 }
+export type UsageTokenCounts = {
+  input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number; reasoning_tokens?: number;
+}
+export type UsageCounts = {
+  calls: number; successful: number; errors: number; rate_limited: number;
+  input_tokens: number | null; output_tokens: number | null; cache_read_input_tokens: number | null;
+  cache_creation_input_tokens: number | null; reasoning_tokens: number | null; estimated_dbu: number | null;
+}
+export type InferenceCallMetric = {
+  id: string; purpose: 'agent' | 'compaction' | 'title'; model: string;
+  created: string | number; status: string; http_status?: number | null;
+  usage?: UsageTokenCounts;
+  estimated_dbu?: number | null;
+}
+export type UsageMetrics = {
+  scope: 'session'; complete: boolean; totals: UsageCounts; calls: InferenceCallMetric[];
+  by_purpose: Array<UsageCounts & { key: string; label: string }>;
+  by_model: Array<UsageCounts & { key: string }>;
+  pricing: { currency: 'DBU'; unit: string; label: string; source_url: string; effective_at: string; estimated: true };
+}
 export type DelegationProgress = {
   status: string; completed_tools: number; last_tool?: string; terminal_reason?: string;
 }

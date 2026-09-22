@@ -127,9 +127,11 @@ To move selected chat history between machines, use **Agent tools → Conversati
 Export conversation**, then import the JSON on the other machine and explicitly
 choose its local project folder. Imports receive fresh IDs, Manual permissions,
 no folder grants, and no active skills; they never overwrite existing conversations.
-For a full database backup, stop both servers before copying
-`.local/conversations.sqlite3`. A database copy retains absolute paths and grants,
-unlike the safer selected-conversation import.
+For a complete local backup, stop both servers before copying the entire `.local/`
+directory. The `conversations/` JSONL files retain absolute paths and grants, unlike
+the safer selected-conversation import. They also retain each chat's sanitized command-job
+snapshots. The SQLite file contains the separate live operational indexes/controllers
+for jobs, tasks, checkpoints, and worktrees.
 
 ### Conversation durability and copies
 
@@ -139,7 +141,8 @@ completion and Stop flush the final state. After an abrupt process death, the la
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
-recent history may not have been saved. SQLite backups remain important.
+recent history may not have been saved. Back up both the conversation JSONL files
+and the separate operational SQLite database.
 
 **Agent tools → Conversation** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
@@ -158,10 +161,9 @@ be forked; running/failed turns and arbitrary turn selection are not supported.
 Forks also start in Manual with no folder grants or active skills, retain any tool
 profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
 
-The sidebar now reads a separate small SQLite metadata table instead of loading
-every transcript. Existing databases are backfilled once, and summary rows update
-transactionally with conversation saves, imports, and deletion. Transcript content
-is still loaded when opening a conversation or performing restart recovery.
+The sidebar reads the small metadata record at the start of each conversation file
+instead of loading every event and provider-history record. Full content is loaded
+when opening a conversation or performing restart recovery.
 
 ## Working with the app
 
@@ -257,10 +259,17 @@ new location, update `.env`, and then restart the app. Keep the state directory
 outside the selected project workspace when using a custom name so agent file
 tools cannot browse it.
 
-- `conversations.sqlite3`: the app's chat history. The `sessions` table has one row
-  per UUID; its `data` column is JSON containing display events, the Databricks
-  message/tool history (`wire`), model, workspace, permissions, and folder grants.
-  The separate `jobs` table stores command metadata, states, and bounded output.
+- `conversations/<conversation-id>.jsonl`: one complete, private file per chat.
+  Records include conversation metadata, user and assistant events, reasoning and
+  request usage, tool calls and results, and the exact Databricks message/tool
+  history (`wire`). Commands associated with the chat are included as sanitized job
+  records with their command, state, limits, exit status, and bounded retained output.
+  Files are atomically replaced as current-state snapshots rather than appended
+  indefinitely while an answer streams.
+- `conversations.sqlite3`: operational state only. Its `jobs` table stores command
+  metadata, states, and bounded output for live control and restart recovery; terminal
+  job snapshots are also mirrored into the owning chat JSONL. Chat messages, assistant
+  replies, model/tool history, and inference ledgers are not stored in SQLite.
   At most four jobs run at once; the latest 100 finished jobs are retained across
   all conversations/workspaces. Same titles never merge sessions. Browser storage
   is not the source of conversation history.
@@ -274,22 +283,28 @@ tools cannot browse it.
 
 New sessions have empty message history and fresh permissions.
 Project files are shared on disk when chats select the same workspace; starting a
-new chat does not copy or isolate the project filesystem. Stop the server before
-copying the database for migration so SQLite's live WAL files are settled.
+new chat does not copy or isolate the project filesystem. On first startup after
+this storage change, legacy `sessions` rows are durably migrated to individual
+JSONL files before those chat tables are removed. Stop the server before copying
+state so JSONL replacements and SQLite WAL files are settled.
 
 ### Provider-reported usage
 
 Request details retain the latest valid usage snapshot returned for each streamed
 chat-model request: input, output, total, cache read/write, and reasoning tokens
-when supplied. Repeated stream snapshots are not added together. Missing fields
-are unavailable, not zero; a reported zero is retained. Usage received before an
-interruption may be partial, not a final count. The app does not estimate missing
-provider usage, infer monetary cost, or retry solely to obtain usage.
+when supplied. **Agent tools → Usage** adds a per-conversation graph and durable
+attempt ledger for agent, title, compaction, and retry calls. Repeated stream
+snapshots are not added together. Missing provider fields remain unavailable; usage
+received before an interruption may be partial, not a final count.
 
-These are per-request records, not account-wide usage or a billing report. They
-exclude automatic conversation-title and context-summary requests; a delegated
-child's requests are recorded in its own conversation. Databricks streaming
-responses may omit usage. Existing chats cannot acquire usage retroactively.
+For recognized standard pay-per-token endpoints, the Usage section calculates an
+estimated DBU cost from published input, output, cache-read, and cache-write rates.
+It does not estimate missing token counts. This is not an account-wide report or an
+invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
+delayed billing adjustments can differ. Older chats that predate the ledger show
+visible agent-call totals as incomplete because title, summary, and retry attempts
+cannot be reconstructed. A delegated child's requests stay in its own conversation.
+Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below remains a separate
 pre-request estimate even when reported usage is available.
@@ -297,9 +312,10 @@ pre-request estimate even when reported usage is available.
 Every chat, title, and summary call is sent to
 `DBRICKS_URL/serving-endpoints/<selected endpoint>/invocations`; the app does not
 call Anthropic directly. A blank Serving endpoint health chart is not a request
-ledger and does not show that traffic bypassed Databricks. Use the app's Request
-details for recorded chat calls, [AI Gateway inference tables](https://docs.databricks.com/aws/en/ai-gateway/inference-tables)
-when enabled for request/response logs, and [`system.billing.usage`](https://docs.databricks.com/aws/en/admin/system-tables/model-serving-cost)
+ledger and does not show that traffic bypassed Databricks. Use the app's Usage
+section for immediate per-conversation telemetry,
+[`system.ai_gateway.usage`](https://docs.databricks.com/aws/en/ai-gateway/usage-tracking)
+for workspace/account observability, and [`system.billing.usage`](https://docs.databricks.com/aws/en/ai-gateway/cost-observability)
 for billable usage. Those surfaces have different scopes and update timing.
 For chat and context-summary calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response
 received before streaming begins is retried at most three times. The app honors numeric or HTTP-date `Retry-After`
@@ -320,7 +336,12 @@ existing conversations. The configured total includes space for both input and
 reply. **Settings → Max output tokens** defaults to 8,192 and accepts
 1,024–131,072, but must be below the context budget minus the 2,048-token safety
 margin. The output setting is also the reply reserve, so the defaults leave an
-estimated input budget of 120,832 tokens.
+estimated input budget of 120,832 tokens. You can explicitly select 20,000 for one
+long Claude Opus 4.8 response, but that reserves its entire standard 20,000 OTPM
+allowance at admission; subsequent agent/tool-loop requests can receive 429s until
+earlier output leaves the rolling window. The 8,192 default leaves throughput for
+multi-step work, while output-limit responses can continue automatically in smaller
+steps up to the bounded retry limit.
 The meter estimates the last prepared model input using roughly one token per
 three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
 overhead. This heuristic varies from the actual model tokenizer and is not a
@@ -365,7 +386,7 @@ summary limits are separate from the main reply limit and total context budget.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
-in SQLite. Summary requests are additional billed inference. A failed or stopped
+in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
 If the latest turn, tool output, or project guidance alone is too large, the app
@@ -683,13 +704,13 @@ bundle after starting the backend, restart the backend to register static assets
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/permissions.py`: shared mode rules and model instructions.
-- `backend/local_agent/store.py`: SQLite conversation storage.
+- `backend/local_agent/store.py`: per-conversation JSONL storage and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
-- `backend/local_agent/telemetry.py`: validated provider usage and inference failure categories.
+- `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
@@ -702,4 +723,6 @@ bundle after starting the backend, restart the backend to register static assets
 Provider documentation:
 [Databricks function calling](https://docs.databricks.com/aws/en/machine-learning/model-serving/function-calling),
 [reasoning models](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models),
+[Foundation Model rate limits](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits),
+[Foundation Model DBU pricing](https://www.databricks.com/product/pricing/proprietary-foundation-model-serving),
 and [official Python MCP transports](https://py.sdk.modelcontextprotocol.io/client/transports/).

@@ -152,14 +152,18 @@ class JobManager:
             if job["state"] == "running":
                 job.update(state="interrupted", updated=time.time(),
                            output=job["output"] + "\n[Server restarted; command outcome is unknown. The command was not restarted.]")
-                self._persist(job)
+                self._persist(job, mirror=True)
+            else:
+                self.store.save_job(job)
             self._jobs[job["id"]] = job
         self._prune()
 
-    def _persist(self, job):
+    def _persist(self, job, *, mirror=False):
         self.store.db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?)",
                               (job["id"], job["session_id"], job["workspace"], json.dumps(job)))
         self.store.db.commit()
+        if mirror:
+            self.store.save_job(job)
 
     async def _notify(self, job):
         if self.on_update is not None:
@@ -219,7 +223,7 @@ class JobManager:
                "exit_code": None, "output": "", "truncated": False, "timeout_seconds": timeout_seconds,
                "max_output_bytes": max_output_bytes, "background": bool(background)}
         self._jobs[job["id"]] = job
-        self._persist(job)
+        self._persist(job, mirror=True)
         # Publication precedes execution. A concurrent stop during publication
         # can cancel this queued job without ever starting a process.
         try:
@@ -257,7 +261,7 @@ class JobManager:
                 job.update(exit_code=result["exit_code"], truncated=result["truncated"],
                            output=sanitize(result["output"], partial=result["truncated"] or job["state"] in {"cancelled", "timed_out"}))
             job["updated"] = time.time()
-            self._persist(job)
+            self._persist(job, mirror=True)
             self._prune()
             await self._notify(job)
 
@@ -282,7 +286,7 @@ class JobManager:
             # A task cancelled before its first instruction never enters _run.
             if job["state"] == "running":
                 job.update(state="cancelled", updated=time.time())
-                self._persist(job)
+                self._persist(job, mirror=True)
                 self._prune()
                 await self._notify(job)
         return copy.deepcopy(job)

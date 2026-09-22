@@ -100,6 +100,22 @@ async def test_missing_usage_and_model_switch_keep_per_request_identity(runtime,
     assert all("usage" not in info for info in infos)
 
 
+async def test_request_attempt_is_durable_before_provider_admission(runtime, monkeypatch):
+    manager, session = runtime
+
+    async def gateway(request):
+        saved = manager.store.get(session["id"])
+        call = saved["inference_calls"][-1]
+        assert call["purpose"] == "agent"
+        assert call["status"] == "running"
+        assert "finished" not in call
+        return httpx.Response(200, text=sse(chunk()))
+
+    mock_gateway(monkeypatch, gateway)
+    await manager.run_databricks(session, "Hello")
+    assert manager.store.get(session["id"])["inference_calls"][-1]["status"] == "completed"
+
+
 @pytest.mark.parametrize("status, kind", [(400, "invalid_request"), (401, "authentication"),
     (403, "permission"), (429, "rate_limit"), (500, "server")])
 async def test_http_failures_are_typed_redacted_and_not_retried(runtime, monkeypatch, status, kind):
@@ -150,6 +166,12 @@ async def test_pre_admission_rate_limit_retries_same_request_without_duplicate_r
     assert not any(event["type"] == "error" for event in session["events"])
     assert any(event["type"] == "notice" and "rate limited the model request" in event["text"]
                for event in session["events"])
+    calls = session["inference_calls"]
+    assert len(calls) == 2
+    assert [(call["purpose"], call["attempt"], call["status"], call.get("http_status"))
+            for call in calls] == [
+                ("agent", 1, "error", 429), ("agent", 2, "completed", 200)]
+    assert calls[0]["error_kind"] == "rate_limit"
 
 
 async def test_pre_admission_rate_limit_stops_after_bounded_retries(runtime, monkeypatch):

@@ -25,7 +25,10 @@ from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
 from .reasoning import reasoning_summary
 from .titles import fallback_title, generate_title, needs_title
-from .telemetry import InferenceError, http_error_kind, stream_error_kind, reported_usage
+from .telemetry import (
+    InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
+    reported_usage, stream_error_kind,
+)
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
@@ -249,7 +252,8 @@ def repair_tool_history(wire, events, state):
 def public_session(session, status="idle"):
     return {"permission_mode": "manual", "allowed_directories": [],
             **{k: v for k, v in session.items()
-               if k not in ("wire", "context_state", "instruction_directories")}, "status": status}
+               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs")},
+            "status": status}
 
 
 class AgentManager:
@@ -270,6 +274,10 @@ class AgentManager:
         for summary in store.list():
             session = store.get(summary["id"])
             interrupted = False
+            for call in session.get("inference_calls", []):
+                if isinstance(call, dict) and call.get("status") == "running":
+                    finish_inference_call(call, {"status": "interrupted", "error_kind": "incomplete_response"})
+                    interrupted = True
             for event in session["events"]:
                 if event.get("state") in ("running", "pending"):
                     event["state"] = "cancelled"
@@ -540,7 +548,7 @@ class AgentManager:
             if completed and needs_title(session):
                 previous_title = session["title"]
                 await self.status(session, "naming")
-                title = await generate_title(self.settings, session)
+                title = await generate_title(self.settings, session, self.store.save)
                 if title and needs_title(session) and session["title"] == previous_title:
                     session.update(title=title, title_generated=True)
                     self.store.save(session)
@@ -804,34 +812,71 @@ class AgentManager:
     async def summarize_context(self, session, client, url, headers, previous, chunk, preservation_note=""):
         await self.status(session, "compacting")
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            response = await client.post(url, headers=headers, json={
-                "messages": build_summary_messages(previous, chunk, preservation_note),
-                "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
-            })
-            diagnostic = self.settings.redact(response.text)[:1000]
-            if (response.status_code == 429 and retryable_rate_limit(diagnostic)
-                    and attempt < MAX_RATE_LIMIT_RETRIES):
+            call = begin_inference_call(
+                session, "compaction", session["model"], max_output_tokens=SUMMARY_MAX_TOKENS,
+                attempt=attempt + 1)
+            # Persist the attempt before provider admission so an abrupt process
+            # exit cannot erase a request that Databricks may already have billed.
+            self.store.save(session)
+            try:
+                response = await client.post(url, headers=headers, json={
+                    "messages": build_summary_messages(previous, chunk, preservation_note),
+                    "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
+                })
+                info = {"status": "running", "http_status": response.status_code}
                 try:
-                    retry_payload = response.json()
+                    payload = response.json()
                 except (json.JSONDecodeError, TypeError):
-                    retry_payload = None
-                delay = retry_after_seconds(response.headers, attempt, retry_payload)
-                await self.event(session, "notice", text=(
-                    f"Databricks rate limited context compaction. Retrying in {delay:g} seconds "
-                    f"({attempt + 1} of {MAX_RATE_LIMIT_RETRIES})."))
-                await asyncio.sleep(delay)
-                continue
-            break
-        if response.status_code != 200:
-            suffix = f": {diagnostic}" if diagnostic else "."
-            raise ValueError(f"Context compaction failed (HTTP {response.status_code}){suffix} "
-                             "History is preserved; retry or adjust the context budget in Settings.")
-        choices = response.json().get("choices", [])
-        finish_reason = choices[0].get("finish_reason") if choices else None
-        if finish_reason != "stop":
-            raise ValueError(f"Context compaction did not finish (finish reason: {finish_reason or 'unavailable'}). "
-                             "History is preserved; retry with a larger context budget.")
-        return visible_text(choices[0].get("message", {}).get("content"))
+                    payload = None
+                usage = reported_usage(payload.get("usage")) if isinstance(payload, dict) else {}
+                if usage:
+                    info["usage"] = usage
+                diagnostic = self.settings.redact(response.text)[:1000]
+                if response.status_code != 200:
+                    info.update(status="error", error_kind=http_error_kind(response.status_code))
+                    finish_inference_call(call, info)
+                    self.store.save(session)
+                    if (response.status_code == 429 and retryable_rate_limit(diagnostic)
+                            and attempt < MAX_RATE_LIMIT_RETRIES):
+                        delay = retry_after_seconds(response.headers, attempt, payload)
+                        await self.event(session, "notice", text=(
+                            f"Databricks rate limited context compaction. Retrying in {delay:g} seconds "
+                            f"({attempt + 1} of {MAX_RATE_LIMIT_RETRIES})."))
+                        await asyncio.sleep(delay)
+                        continue
+                    suffix = f": {diagnostic}" if diagnostic else "."
+                    raise ValueError(f"Context compaction failed (HTTP {response.status_code}){suffix} "
+                                     "History is preserved; retry or adjust the context budget in Settings.")
+                if not isinstance(payload, dict):
+                    raise ValueError("Context compaction returned a malformed response. History is preserved.")
+                choices = payload.get("choices", [])
+                finish_reason = choices[0].get("finish_reason") if choices and isinstance(choices[0], dict) else None
+                info["finish_reason"] = finish_reason or "unavailable"
+                if finish_reason != "stop":
+                    info.update(status="error", error_kind=(
+                        "output_limit" if finish_reason == "length" else "incomplete_response"))
+                    finish_inference_call(call, info)
+                    self.store.save(session)
+                    raise ValueError(
+                        f"Context compaction did not finish (finish reason: {finish_reason or 'unavailable'}). "
+                        "History is preserved; retry with a larger context budget.")
+                info["status"] = "completed"
+                finish_inference_call(call, info)
+                self.store.save(session)
+                return visible_text(choices[0].get("message", {}).get("content"))
+            except asyncio.CancelledError:
+                if call.get("status") == "running":
+                    finish_inference_call(call, {"status": "cancelled"})
+                    self.store.save(session)
+                raise
+            except Exception as exc:
+                if call.get("status") == "running":
+                    kind = ("network" if isinstance(exc, httpx.RequestError)
+                            else "invalid_response" if isinstance(exc, (json.JSONDecodeError, KeyError, TypeError))
+                            else "unknown")
+                    finish_inference_call(call, {"status": "error", "error_kind": kind})
+                    self.store.save(session)
+                raise
 
     def start_compaction(self, session_id, preservation_note=""):
         if self.statuses.get(session_id, "idle") != "idle" or (session_id in self.tasks and not self.tasks[session_id].done()):
@@ -898,6 +943,15 @@ class AgentManager:
     async def model_response(self, session, event, client, url, headers, payload):
         info = dict(event["request_info"])
         event["request_info"] = info
+        attempt = 1 + sum(
+            isinstance(item, dict) and item.get("event_id") == event["id"]
+            for item in session.get("inference_calls", []))
+        call = begin_inference_call(
+            session, "agent", session["model"], event_id=event["id"],
+            max_output_tokens=payload.get("max_tokens"), attempt=attempt)
+        # Record the attempt durably before sending it to the provider. Later
+        # stream checkpoints replace this running state with the final outcome.
+        self.store.save(session)
         draft = StreamDraft(self.store, session)
         tool_buffer, finish = ToolCallBuffer(), None
         try:
@@ -1017,6 +1071,7 @@ class AgentManager:
             info.update(status="error", error_kind=exc.kind)
             raise exc
         finally:
+            finish_inference_call(call, info)
             await draft.close()
             try:
                 await self.update_event(session, event, request_info=info)

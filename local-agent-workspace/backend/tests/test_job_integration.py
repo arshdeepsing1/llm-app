@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
-from local_agent.agents import AgentManager
+from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.store import Store
@@ -101,6 +101,11 @@ async def test_model_cannot_inspect_or_stop_another_conversations_job(runtime):
         assert "not found in this conversation" in result
     assert manager.jobs.get(job["id"])["state"] == "running"
     assert json.loads(await manager.execute_tool(session, tools, "list_jobs", {}, "list")) == {"jobs": [], "next_offset": None}
+
+
+def test_public_session_does_not_expose_canonical_command_history():
+    session = {"id": "chat", "events": [], "wire": [], "command_jobs": [{"command": "private"}]}
+    assert "command_jobs" not in public_session(session)
 
 
 async def test_unicode_job_output_pages_bound_serialized_size_without_losing_characters(runtime):

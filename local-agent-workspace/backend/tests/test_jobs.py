@@ -273,6 +273,49 @@ async def test_job_state_persistence_failures_and_defensive_copies(store, tmp_pa
     assert manager.get("missing") is None
 
 
+async def test_background_job_snapshots_are_kept_in_the_conversation_jsonl(store, tmp_path, monkeypatch):
+    session = {"id": "chat", "title": "Command chat", "created": 1, "updated": 1,
+               "workspace": str(tmp_path), "model": "model", "events": [], "wire": []}
+    store.save(session)
+    manager = JobManager(store, lambda text: text, None)
+    mirrored = []
+    save_job = store.save_job
+
+    def capture(job):
+        mirrored.append((job["state"], job["output"]))
+        save_job(job)
+
+    monkeypatch.setattr(store, "save_job", capture)
+
+    command = "printf first; sleep .2; printf last"
+    started = await manager.start(command, tmp_path, session_id=session["id"], background=True)
+    running = store.get(session["id"])["command_jobs"]
+    assert len(running) == 1
+    assert running[0]["id"] == started["id"]
+    assert running[0]["command"] == command
+    assert running[0]["state"] == "running"
+
+    # A later save from an in-memory session created before the job must not
+    # erase the canonical command ledger.
+    store.save(session)
+    assert store.get(session["id"])["command_jobs"][0]["id"] == started["id"]
+
+    completed = await manager.wait(started["id"])
+    saved = store.get(session["id"])["command_jobs"]
+    assert saved == [completed]
+    assert saved[0]["state"] == "completed"
+    assert saved[0]["exit_code"] == 0
+    assert saved[0]["output"] == "firstlast"
+    assert saved[0]["updated"] >= saved[0]["created"]
+    assert mirrored == [("running", ""), ("completed", "firstlast")]
+
+    records = [json.loads(line) for line in (store.conversations / "chat.jsonl").read_text().splitlines()]
+    assert [record for record in records if record["record"] == "command_job"] == [
+        {"record": "command_job", "data": completed}]
+    operational = json.loads(store.db.execute("SELECT data FROM jobs WHERE id=?", (started["id"],)).fetchone()[0])
+    assert saved[0] == operational
+
+
 async def test_stalled_observer_is_bounded_and_does_not_hold_shutdown(store, tmp_path, monkeypatch):
     monkeypatch.setattr("local_agent.jobs.UPDATE_TIMEOUT_SECONDS", .05)
 
@@ -415,3 +458,48 @@ async def test_retention_prunes_only_old_completed_jobs(store, tmp_path, monkeyp
     assert len(manager.list()) == 3
     await manager.shutdown()
     assert len(manager.list()) == 2
+
+
+async def test_operational_job_pruning_does_not_erase_conversation_history(store, tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.jobs.MAX_COMPLETED_JOBS", 2)
+    session = {"id": "history", "title": "History", "created": 1, "updated": 1,
+               "workspace": str(tmp_path), "model": "model", "events": [], "wire": []}
+    store.save(session)
+    manager = JobManager(store, lambda text: text, None)
+
+    completed = []
+    for index in range(3):
+        job = await manager.start(f"printf {index}", tmp_path, session_id=session["id"], background=True)
+        completed.append(await manager.wait(job["id"]))
+
+    assert manager.get(completed[0]["id"]) is None
+    history = store.get(session["id"])["command_jobs"]
+    assert [job["id"] for job in history] == [job["id"] for job in completed]
+    assert [job["output"] for job in history] == ["0", "1", "2"]
+
+
+async def test_restart_does_not_rewrite_already_mirrored_terminal_jobs(tmp_path, monkeypatch):
+    path = tmp_path / "restart.sqlite3"
+    store = Store(path)
+    session = {"id": "restart-chat", "title": "Restart", "created": 1, "updated": 1,
+               "workspace": str(tmp_path), "model": "model", "events": [], "wire": []}
+    store.save(session)
+    manager = JobManager(store, lambda text: text, None)
+    job = await manager.start("printf done", tmp_path, session_id=session["id"], background=True)
+    await manager.wait(job["id"])
+    store.db.close()
+
+    reopened = Store(path)
+    writes = []
+    write = reopened._write
+
+    def capture(*args, **kwargs):
+        writes.append(args[0]["id"])
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(reopened, "_write", capture)
+    JobManager(reopened, lambda text: text, None)
+
+    assert writes == []
+    assert reopened.get(session["id"])["command_jobs"][0]["state"] == "completed"
+    reopened.db.close()

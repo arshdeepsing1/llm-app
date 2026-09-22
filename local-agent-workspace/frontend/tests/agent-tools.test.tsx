@@ -9,6 +9,16 @@ const worktree = { id: 'worktree', path: '/project-worktree', branch: 'feature/t
 const task = { id: 'task', title: 'Inspect source', description: 'Find the parser', status: 'pending', depends_on: [] }
 const config = { servers: [], hooks: [] }
 const skill = { id: 'skill', name: 'Review code', description: 'Review changes carefully', path: '/skills/review/SKILL.md' }
+const metrics = {
+  scope: 'session', complete: true,
+  totals: { calls: 2, successful: 1, errors: 1, rate_limited: 1, input_tokens: 1200, output_tokens: 300, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, reasoning_tokens: 20, estimated_dbu: 0.2039292 },
+  calls: [
+    { id: 'call-1', purpose: 'agent', model: 'databricks-claude-opus-4-8', created: '2026-09-22T10:00:00Z', status: 'completed', usage: { input_tokens: 1200, output_tokens: 300, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, reasoning_tokens: 20 }, estimated_dbu: 0.2039292 },
+    { id: 'call-2', purpose: 'compaction', model: 'databricks-claude-opus-4-8', created: '2026-09-22T10:01:00Z', status: 'error', http_status: 429, estimated_dbu: 0 },
+  ],
+  by_purpose: [], by_model: [],
+  pricing: { currency: 'DBU', unit: 'per_1m_tokens', label: 'Databricks pay-per-token list-price DBU estimate', source_url: 'https://www.databricks.com/product/pricing/proprietary-foundation-model-serving', effective_at: '2026-09-22', estimated: true },
+}
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 const deferred = <T,>() => {
   let resolve!: (value: T) => void
@@ -39,6 +49,7 @@ beforeEach(() => {
     if (path.includes('/tasks/')) return json({ ...task, ...JSON.parse(options.body as string) })
     if (path.endsWith('/children')) return json([{ ...session('child'), title: 'Child review', status: 'awaiting_approval' }])
     if (path.endsWith('/subagent-profile')) return json({ ...session(), subagent_tool_profile: JSON.parse(options.body as string).tool_profile })
+    if (path.endsWith('/metrics')) return json(metrics)
     if (path === '/api/extensions') return json(options.method === 'PUT' ? JSON.parse(options.body as string) : config)
     if (path === '/api/extensions/test') return json({ tools: ['example.search'] })
     if (path === '/api/skills' || path.startsWith('/api/skills?')) return json([skill])
@@ -143,6 +154,50 @@ it('creates scoped worktrees from explicit branches and opens their conversation
   fireEvent.click(screen.getByRole('button', { name: 'Open conversation in feature/test' }))
   await waitFor(() => expect(onSelectSession).toHaveBeenCalledWith('worktree-session'))
   expect(onClose).toHaveBeenCalledOnce()
+})
+
+it('shows a separate per-conversation usage graph and estimated DBU cost', async () => {
+  const view = await openTab('Usage')
+  expect(await screen.findByText('0.2039 DBU')).toBeTruthy()
+  expect(screen.getAllByText('Uncached input')[0].parentElement?.textContent).toContain('1,200')
+  expect(screen.getAllByText('Cache read')[0].parentElement?.textContent).toContain('300')
+  expect(screen.getAllByText('Cache write')[0].parentElement?.textContent).toContain('100')
+  expect(screen.getByText('Input incl. cache')).toBeTruthy()
+  expect(screen.getByRole('img', { name: /Tokens by model call/ })).toBeTruthy()
+  expect(screen.getByText('compaction')).toBeTruthy()
+  expect(screen.getByText('error · 429')).toBeTruthy()
+  expect(screen.getByText(/near-real-time estimate/)).toBeTruthy()
+  expect(fetchMock.mock.calls.some(([path]) => path === '/api/sessions/a/metrics')).toBe(true)
+  const requests = fetchMock.mock.calls.filter(([path]) => path === '/api/sessions/a/metrics').length
+  view.rerender(<AgentToolsDialog session={{ ...session(), status: 'running' }} onClose={onClose} onSelectSession={onSelectSession} onError={vi.fn()} />)
+  await act(async () => { await Promise.resolve() })
+  expect(fetchMock.mock.calls.filter(([path]) => path === '/api/sessions/a/metrics')).toHaveLength(requests)
+})
+
+it('renders missing provider usage as unavailable rather than zero', async () => {
+  override = path => path === '/api/sessions/a/metrics' ? Promise.resolve(json({
+    ...metrics,
+    totals: { ...metrics.totals, input_tokens: null, output_tokens: null,
+      cache_read_input_tokens: null, cache_creation_input_tokens: null,
+      reasoning_tokens: null, estimated_dbu: null },
+    calls: [{ id: 'missing', purpose: 'agent', model: 'databricks-claude-opus-4-8',
+      created: '2026-09-22T10:00:00Z', status: 'error', usage: { input_tokens: 7 },
+      estimated_dbu: null }],
+  })) : undefined
+  await openTab('Usage')
+  expect((await screen.findAllByText('Unavailable')).length).toBeGreaterThanOrEqual(3)
+  const table = screen.getByRole('table', { name: 'Model calls for this conversation' })
+  expect(within(table).getAllByText('—').length).toBeGreaterThanOrEqual(3)
+})
+
+it('explains incomplete legacy usage and does not request metrics without a conversation', async () => {
+  override = path => path === '/api/sessions/a/metrics' ? Promise.resolve(json({ ...metrics, complete: false })) : undefined
+  await openTab('Usage')
+  expect(await screen.findByText(/older conversation has no complete inference ledger/)).toBeTruthy()
+  cleanup()
+  await openTab('Usage', null)
+  expect(screen.getByText('Start a conversation to track its model usage.')).toBeTruthy()
+  expect(fetchMock.mock.calls.some(([path]) => path === '/api/sessions/null/metrics')).toBe(false)
 })
 
 it('shows refused worktree removal inline without losing the worktree', async () => {
