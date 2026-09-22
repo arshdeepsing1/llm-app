@@ -218,6 +218,18 @@ it('collapses activity while retaining actual tool states and independent approv
   expect(details.open).toBe(false)
 })
 
+it('shows distinct tool diagnostics while failed actions are collapsed', () => {
+  render(<Conversation onError={vi.fn()} session={makeSession([
+    { id: 'file', type: 'tool', name: 'search_files', state: 'error', input: { path: 'run.log' }, output: 'Search path must be a regular file or directory.' },
+    { id: 'timeout', type: 'tool', name: 'search_files', state: 'error', input: { path: '/large' }, output: 'File query time limit reached; narrow the path, glob, or line range.' },
+    { id: 'regex', type: 'tool', name: 'search_files', state: 'error', input: { query: 'connect(' }, output: 'Invalid regular expression: missing ).' },
+  ])} />)
+  expect(screen.getByText('Search path must be a regular file or directory.')).toBeTruthy()
+  expect(screen.getByText('File query time limit reached; narrow the path, glob, or line range.')).toBeTruthy()
+  expect(screen.getByText('Invalid regular expression: missing ).')).toBeTruthy()
+  expect(screen.queryByText('Tool returned an error')).toBeNull()
+})
+
 it('names persisted task actions and distinguishes task status from action success', () => {
   render(<Conversation onError={vi.fn()} session={makeSession([
     { id: 'create', type: 'tool', name: 'create_task', state: 'completed', input: { title: 'Write exporter script' },

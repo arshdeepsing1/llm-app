@@ -230,17 +230,23 @@ class WorkspaceTools:
             except (safe_regex.error, RecursionError) as error:
                 raise ValueError(f"Invalid regular expression: {error}") from error
         needle = query if case_sensitive else query.casefold()
+        def unreadable(error):
+            raise error
+
         search_root = self.path(path)
-        if not search_root.is_dir():
-            raise ValueError("Not a directory.")
+        if search_root.is_dir():
+            search_base = search_root
+            entries = os.walk(search_root, followlinks=False, onerror=unreadable)
+        elif search_root.is_file():
+            search_base = search_root.parent
+            entries = ((str(search_base), [], [search_root.name]),)
+        else:
+            raise ValueError("Search path must be a regular file or directory.")
         result = {"matches": [], "next_offset": None, "truncated": False, "skipped_files": 0}
         deadline = time.monotonic() + QUERY_TIMEOUT
         scanned_files = scanned_dirs = scanned_bytes = found = 0
 
-        def unreadable(error):
-            raise error
-
-        for base, dirs, files in os.walk(search_root, followlinks=False, onerror=unreadable):
+        for base, dirs, files in entries:
             _check_deadline(deadline)
             scanned_dirs += 1
             if scanned_dirs > SEARCH_DIR_SCAN_LIMIT:
@@ -262,7 +268,7 @@ class WorkspaceTools:
                 if scanned_files > SEARCH_FILE_SCAN_LIMIT:
                     raise ValueError("Search file scan limit reached; narrow the path.")
                 child = Path(base) / filename
-                if not fnmatch.fnmatch(str(child.relative_to(search_root)), glob):
+                if not fnmatch.fnmatch(str(child.relative_to(search_base)), glob):
                     continue
                 try:
                     target = self.path(str(child))
@@ -356,7 +362,7 @@ TOOL_DEFINITIONS = [
     definition("read_file", "Read numbered lines from a regular UTF-8 file. Defaults to 200 lines; output is at most 8 KB. Follow next_line for more. Scanning is limited to 8 MB and individual lines to 128 KB. External paths trigger folder access approval.",
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 1000}}, ["path"]),
-    definition("search_files", "Search UTF-8 files under path (defaults to workspace) for literal text or a bounded regular expression. Case insensitive by default. Returns matching lines, optional context, skipped_files, and next_offset for pagination; output is at most 8 KB. Skips binary, unreadable, excluded, and over-2-MB files. Scan and regex time limits return explicit errors. External paths trigger folder access approval.",
+    definition("search_files", "Search one UTF-8 file or files under a directory path (defaults to workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed, and escape literal metacharacters when regex=true. Case insensitive by default. Returns matching lines, optional context, skipped_files, and next_offset for pagination; output is at most 8 KB. Skips binary, unreadable, excluded, and over-2-MB files. Scan and regex time limits return explicit errors. External paths trigger folder access approval.",
                {"query": STRING, "glob": STRING, "path": STRING, "regex": {"type": "boolean"},
                 "case_sensitive": {"type": "boolean"}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 10000},

@@ -15,7 +15,7 @@ MIN_MAX_OUTPUT_TOKENS = 1024
 MAX_MAX_OUTPUT_TOKENS = 131072
 REPLY_RESERVE = DEFAULT_MAX_OUTPUT_TOKENS
 SAFETY_MARGIN = 2048
-SUMMARY_MAX_TOKENS = 1024
+SUMMARY_MAX_TOKENS = 4096
 SUMMARY_MAX_BYTES = 3500
 SUMMARY_PREFIX = "Summary of earlier conversation (historical data; follow current user and system instructions):\n"
 
@@ -81,6 +81,10 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         raise ValueError("Choose an output-token limit within the supported range and below the context window minus the safety margin.")
     state = {"summary": "", "through": 0, "compactions": 0, **(state or {})}
     input_budget = context_window - reply_reserve - SAFETY_MARGIN
+    # Summary requests have their own small reply reserve. Reusing the main
+    # response reserve here can turn one compaction into dozens of requests
+    # when a user configures a large main-response limit.
+    summary_input_budget = context_window - SUMMARY_MAX_TOKENS - SAFETY_MARGIN
     messages = [system_message, *context_messages(wire, state)]
     estimate = estimate_tokens(messages, tools)
 
@@ -109,7 +113,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             while low < high:
                 middle = (low + high + 1) // 2
                 request = build_summary_messages(summary, transcript[offset:offset + middle], preservation_note)
-                if estimate_tokens(request) <= input_budget:
+                if estimate_tokens(request) <= summary_input_budget:
                     low = middle
                 else:
                     high = middle - 1
@@ -120,8 +124,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             try:
                 result = await summarize(summary, chunk)
             except Exception as exc:
-                raise ValueError("Conversation summarization failed. Try again, increase the context window, "
-                                 "or start a new conversation.") from exc
+                detail = str(exc).strip() or type(exc).__name__
+                raise ValueError(f"Conversation summarization failed: {detail}") from exc
             if not isinstance(result, str) or not result.strip():
                 raise ValueError("The model returned an empty conversation summary. Try again or choose another model.")
             summary = result.strip()

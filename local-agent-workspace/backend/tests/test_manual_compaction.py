@@ -8,7 +8,9 @@ import pytest
 from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
-from local_agent.context import MIN_CONTEXT_WINDOW, build_summary_messages, estimate_tokens, prepare_context
+from local_agent.context import (
+    MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS, build_summary_messages, estimate_tokens, prepare_context,
+)
 from local_agent.instructions import load_project_instructions
 from local_agent.store import Store
 from local_agent.tools import WorkspaceTools
@@ -65,7 +67,7 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
         payload = json.loads(request.content)
         requests.append(payload)
         assert payload["stream"] is False and "tools" not in payload
-        assert payload["max_tokens"] == 1024
+        assert payload["max_tokens"] == SUMMARY_MAX_TOKENS
         assert "Preserve migration decisions" in payload["messages"][1]["content"]
         return httpx.Response(200, json={"choices": [{"message": {"content": "Migration completed and must remain compatible."}, "finish_reason": "stop"}]})
 
@@ -128,7 +130,41 @@ async def test_manual_failure_or_stop_keeps_previous_summary_and_archive(runtime
     for key in ("wire", "context_state", "context_info"):
         assert saved[key] == original[key]
     assert saved["events"][-1]["type"] == ("notice" if failure == "cancel" else "error")
+    if failure == "http":
+        assert "HTTP 500" in saved["events"][-1]["text"]
+    elif failure == "length":
+        assert "finish reason: length" in saved["events"][-1]["text"]
     assert manager.statuses[session["id"]] == "idle"
+
+
+async def test_manual_compaction_retries_pre_admission_rate_limit_without_losing_state(runtime, monkeypatch):
+    manager, session, _ = runtime
+    requests, delays = [], []
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={
+                "error_code": "REQUEST_LIMIT_EXCEEDED",
+                "message": "Exceeded workspace input tokens per minute rate limit",
+            })
+        return httpx.Response(200, json={"choices": [{
+            "message": {"content": "Earlier work summarized."}, "finish_reason": "stop",
+        }]})
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
+    manager.start_compaction(session["id"])
+    await manager.tasks[session["id"]]
+
+    saved = manager.store.get(session["id"])
+    assert len(requests) == 2 and delays == [0]
+    assert saved["context_state"]["compactions"] == 3
+    assert any(event["type"] == "notice" and "rate limited context compaction" in event["text"]
+               for event in saved["events"])
 
 
 async def test_manual_compaction_can_be_cancelled_before_it_starts(runtime):
@@ -196,7 +232,7 @@ async def test_preservation_note_is_counted_in_each_bounded_summary_request():
 
     async def summarize(previous, chunk):
         request = build_summary_messages(previous, chunk, note)
-        assert estimate_tokens(request) <= MIN_CONTEXT_WINDOW - 8192 - 2048
+        assert estimate_tokens(request) <= MIN_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - 2048
         calls.append(chunk)
         return "Earlier work preserved."
 

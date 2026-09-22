@@ -47,6 +47,13 @@ function ToolDetails({ event, pending }: { event: AgentEvent; pending: boolean }
   </>
 }
 
+function toolOutcome(event: AgentEvent) {
+  if (event.state === 'rejected') return 'Action declined'
+  if (event.state === 'cancelled') return 'Action cancelled'
+  const output = (event.output || '').trim().replace(/\s+/g, ' ')
+  return output ? output.slice(0, 240) + (output.length > 240 ? '…' : '') : 'Tool returned an error'
+}
+
 function DelegationStatus({ event, onSelectSession }: { event: AgentEvent; onSelectSession?: (id: string) => void }) {
   const progress = event.delegation
   if (!progress) return null
@@ -88,7 +95,7 @@ const ToolCard = memo(function ToolCard({ event, summary, sessionId, onError, on
           <button className="primary" disabled={deciding} onClick={() => void decide(true)}><Check size={15} />Approve</button></div>
       </> : <><ToolDetails event={event} pending={false} /><small className="muted">Action: {event.state}</small></>}
     </div> : null}
-    {!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error') ? <p className="tool-outcome">{event.state === 'rejected' ? 'Action declined' : event.state === 'cancelled' ? 'Action cancelled' : 'Tool returned an error'}</p> : null}
+    {!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error') ? <p className="tool-outcome">{toolOutcome(event)}</p> : null}
   </div>
 })
 

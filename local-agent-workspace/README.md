@@ -284,7 +284,7 @@ chat-model request: input, output, total, cache read/write, and reasoning tokens
 when supplied. Repeated stream snapshots are not added together. Missing fields
 are unavailable, not zero; a reported zero is retained. Usage received before an
 interruption may be partial, not a final count. The app does not estimate missing
-provider usage, infer monetary cost, or retry inference to obtain usage.
+provider usage, infer monetary cost, or retry solely to obtain usage.
 
 These are per-request records, not account-wide usage or a billing report. They
 exclude automatic conversation-title and context-summary requests; a delegated
@@ -293,6 +293,19 @@ responses may omit usage. Existing chats cannot acquire usage retroactively.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below remains a separate
 pre-request estimate even when reported usage is available.
+
+Every chat, title, and summary call is sent to
+`DBRICKS_URL/serving-endpoints/<selected endpoint>/invocations`; the app does not
+call Anthropic directly. A blank Serving endpoint health chart is not a request
+ledger and does not show that traffic bypassed Databricks. Use the app's Request
+details for recorded chat calls, [AI Gateway inference tables](https://docs.databricks.com/aws/en/ai-gateway/inference-tables)
+when enabled for request/response logs, and [`system.billing.usage`](https://docs.databricks.com/aws/en/admin/system-tables/model-serving-cost)
+for billable usage. Those surfaces have different scopes and update timing.
+For chat and context-summary calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response
+received before streaming begins is retried at most three times. The app honors numeric or HTTP-date `Retry-After`
+headers and root/nested JSON `retry_after` values, capped at 60 seconds; otherwise
+it waits 5, 15, then 40 seconds. A rate-limit signal after streamed content begins
+is not retried because repeating a partial response could be unsafe.
 
 ### Context and project instructions
 
@@ -325,7 +338,8 @@ and the resulting input budget. Raising it reduces the available input budget an
 works only when the selected endpoint supports the requested value. If a response
 ends at that limit, none of that response's tool calls run. When another configured
 agent step is available, the app automatically retries in smaller steps up to twice;
-the full partial response remains in the visible event, while model history keeps a
+requests recovered this way are recorded as interrupted rather than terminal errors.
+The full partial response remains in the visible event, while model history keeps a
 small omission marker and a hidden app-generated user continuation so role ordering
 survives later turns and restarts. The hidden continuation is not shown as a user chat
 event. If interruption leaves that internal continuation unanswered, the next real user
@@ -343,8 +357,10 @@ any tool in that response executes; the error is recorded without saving broken
 tool calls into model history.
 
 When older turns no longer fit, the same endpoint summarizes them in bounded
-requests with at most 1,024 output tokens per summary request. The retained summary
-must also fit within 3,500 UTF-8 bytes; that byte cap is not a token count. These
+requests with at most 4,096 output tokens per summary request. Summary chunks use
+that independent reply reserve instead of the main response reserve, so increasing
+the main output setting does not multiply the number of compaction requests. The
+retained summary must also fit within 3,500 UTF-8 bytes; that byte cap is not a token count. These
 summary limits are separate from the main reply limit and total context budget.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. Summaries persist across

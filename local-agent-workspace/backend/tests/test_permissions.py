@@ -64,6 +64,25 @@ async def test_external_csv_listing_requires_access_and_remembers_grant(setup, t
         restored_tools.path(str(tmp_path / 'another-folder' / 'note.txt'))
 
 
+async def test_external_single_file_search_requests_its_parent_folder(setup, tmp_path):
+    settings, store, tools = setup
+    external = tmp_path / 'Downloads' / 'report.txt'
+    external.parent.mkdir()
+    external.write_text('find this marker\n')
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    task = asyncio.create_task(manager.execute_tool(
+        session, tools, 'search_files', {'path': str(external), 'query': 'marker'}, 'single-file'))
+    sid, event_id = await pending(manager)
+    event = session['events'][-1]
+    assert event['name'] == 'access_directory'
+    assert event['input'] == {'path': str(external.parent)}
+    manager.decide(sid, event_id, True)
+    result = json.loads(await task)
+    assert [(match['path'], match['line']) for match in result['matches']] == [(str(external), 1)]
+    assert session['allowed_directories'] == [str(external.parent)]
+
+
 async def test_symlink_cannot_expand_a_folder_grant(setup, tmp_path):
     _, _, tools = setup
     approved = tmp_path / 'approved'

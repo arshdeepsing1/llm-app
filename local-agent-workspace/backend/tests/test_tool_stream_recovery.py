@@ -113,6 +113,7 @@ async def test_output_limit_retry_history_is_bounded_persisted_and_resets_after_
     limited_events = [item for item in session["events"]
                       if item.get("request_info", {}).get("error_kind") == "output_limit"]
     assert len(limited_events) == 2 and all(item["text"] == "Partial draft" for item in limited_events)
+    assert all(item["request_info"]["status"] == "interrupted" for item in limited_events)
     notices = [item["text"] for item in session["events"] if item["type"] == "notice"]
     assert len(notices) == 2 and all("(1 of 2)" in text for text in notices)
 
@@ -142,6 +143,10 @@ async def test_output_limit_stops_after_two_automatic_retries(runtime, monkeypat
     with pytest.raises(ValueError, match="after two automatic retries"):
         await manager.run_databricks(session, "Make the change.")
     assert len(requests) == 3
+    limited_events = [item for item in session["events"]
+                      if item.get("request_info", {}).get("error_kind") == "output_limit"]
+    assert [item["request_info"]["status"] for item in limited_events] == [
+        "interrupted", "interrupted", "error"]
     assert [item["role"] for item in session["wire"]] == ["user", "assistant", "user", "assistant", "user", "assistant"]
     assert all(item["content"] == OUTPUT_LIMIT_HISTORY_PLACEHOLDER
                for item in session["wire"] if item["role"] == "assistant")

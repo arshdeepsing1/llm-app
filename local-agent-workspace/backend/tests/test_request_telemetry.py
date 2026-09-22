@@ -4,7 +4,7 @@ import json
 import httpx
 import pytest
 
-from local_agent.agents import AgentManager
+from local_agent.agents import AgentManager, retry_after_seconds
 from local_agent.config import Settings
 from local_agent.store import Store
 from local_agent.telemetry import reported_usage
@@ -48,7 +48,15 @@ def test_usage_only_accepts_reported_nonnegative_integer_fields():
                            "cache_creation_input_tokens": 0, "prompt_tokens_details": {"cached_tokens": 2},
                            "completion_tokens_details": {"reasoning_tokens": 3}}) == {
         "input_tokens": 0, "output_tokens": 5, "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 2, "reasoning_tokens": 3}
+                           "cache_read_input_tokens": 2, "reasoning_tokens": 3}
+
+
+def test_retry_after_accepts_seconds_http_date_and_nested_json_with_a_cap(monkeypatch):
+    assert retry_after_seconds({"retry-after": "3"}, 0) == 3
+    assert retry_after_seconds({}, 0, {"error": {"retry_after": 7}}) == 7
+    monkeypatch.setattr("local_agent.agents.time.time", lambda: 0)
+    assert retry_after_seconds({"retry-after": "Thu, 01 Jan 1970 00:02:00 GMT"}, 0) == 60
+    assert retry_after_seconds({}, 1) == 15
 
 
 @pytest.mark.parametrize("partial", [False, True])
@@ -113,6 +121,63 @@ async def test_http_failures_are_typed_redacted_and_not_retried(runtime, monkeyp
     assert "private-token" not in json.dumps(manager.store.get(session["id"]))
 
 
+async def test_pre_admission_rate_limit_retries_same_request_without_duplicate_reply(runtime, monkeypatch):
+    manager, session = runtime
+    requests, delays = [], []
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(429, json={
+                "error": {
+                    "error_code": "REQUEST_LIMIT_EXCEEDED",
+                    "message": "Exceeded workspace input tokens per minute rate limit",
+                    "retry_after": 0,
+                },
+            })
+        return httpx.Response(200, text=sse(chunk()))
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
+    assert await manager.run_databricks(session, "Hello") is True
+
+    replies = [event for event in session["events"] if event["type"] == "assistant"]
+    assert len(requests) == 2 and delays == [0]
+    assert len(replies) == 1 and replies[0]["request_info"]["status"] == "completed"
+    assert not any(event["type"] == "error" for event in session["events"])
+    assert any(event["type"] == "notice" and "rate limited the model request" in event["text"]
+               for event in session["events"])
+
+
+async def test_pre_admission_rate_limit_stops_after_bounded_retries(runtime, monkeypatch):
+    manager, session = runtime
+    requests, delays = [], []
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "0"}, json={
+            "error_code": "REQUEST_LIMIT_EXCEEDED",
+            "message": "Exceeded workspace input tokens per minute rate limit",
+        })
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
+    await manager.run(session, "Hello")
+
+    assert len(requests) == 4 and delays == [0, 0, 0]
+    reply = next(event for event in session["events"] if event["type"] == "assistant")
+    assert reply["request_info"]["status"] == "error"
+    assert reply["request_info"]["error_kind"] == "rate_limit"
+    assert session["events"][-1]["type"] == "error"
+    assert session["events"][-1]["error_kind"] == "rate_limit"
+
+
 @pytest.mark.parametrize("kind, body", [
     ("output_limit", sse(chunk("Partial", "length", usage={"completion_tokens": 8192}))),
     ("incomplete_response", sse(chunk("Partial", None))),
@@ -148,8 +213,10 @@ async def test_bad_streams_are_typed_and_never_execute_tools(runtime, monkeypatc
     ({"message": "unrecognized provider failure"}, "unknown")])
 async def test_sse_failure_preserves_last_usage_and_redacts_error(runtime, monkeypatch, error, kind):
     manager, session = runtime
+    requests = []
 
     async def gateway(request):
+        requests.append(request)
         return httpx.Response(200, text=sse(chunk("Partial", None, usage={"prompt_tokens": 17}),
             {"error": {**error, "message": "private-token"}}))
 
@@ -158,6 +225,7 @@ async def test_sse_failure_preserves_last_usage_and_redacts_error(runtime, monke
     info = request_event(session)["request_info"]
     assert info["status"] == "error" and info["error_kind"] == kind
     assert info["usage"] == {"input_tokens": 17} and info["http_status"] == 200
+    assert len(requests) == 1
     assert "private-token" not in json.dumps(manager.store.get(session["id"]))
 
 

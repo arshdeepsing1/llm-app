@@ -2,6 +2,8 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import httpx
@@ -30,6 +32,8 @@ from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_RETRY_DELAYS = (5.0, 15.0, 40.0)
 OUTPUT_LIMIT_HISTORY_PLACEHOLDER = (
     "[The previous response reached the configured output-token limit. Its partial text was omitted from "
     "model history, and none of its proposed tool calls ran.]"
@@ -40,6 +44,38 @@ OUTPUT_LIMIT_CONTINUATION = (
     "effects. Split large writes and tool arguments into small, focused steps that fit comfortably within the "
     "output limit."
 )
+
+
+def retry_after_seconds(headers, attempt, payload=None):
+    """Use a bounded provider delay when present, otherwise bounded backoff."""
+    nested = payload.get("error") if isinstance(payload, dict) else None
+    values = [headers.get("retry-after")]
+    for candidate in (payload, nested):
+        if isinstance(candidate, dict):
+            values.append(candidate.get("retry_after"))
+    for value in values:
+        if value is None:
+            continue
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            if not isinstance(value, str):
+                continue
+            try:
+                moment = parsedate_to_datetime(value)
+                if moment.tzinfo is None:
+                    moment = moment.replace(tzinfo=timezone.utc)
+                seconds = moment.timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if seconds >= 0:
+            return min(seconds, 60.0)
+    return RATE_LIMIT_RETRY_DELAYS[attempt]
+
+
+def retryable_rate_limit(text):
+    normalized = text.lower().replace("_", " ")
+    return "request limit exceeded" in normalized or "rate limit" in normalized
 
 
 SYSTEM_PROMPT = """You are Local, a practical coding assistant working in the user's selected workspace.
@@ -613,7 +649,7 @@ class AgentManager:
                     return output
                 target = tools.path(arguments.get("path", "."))
                 if target.is_relative_to(tools.root):
-                    directory = target if name in ("list_files", "search_files") else target.parent
+                    directory = target if name in ("list_files", "search_files") and target.is_dir() else target.parent
                     relative = directory.relative_to(tools.root).as_posix()
                     directories = session.setdefault("instruction_directories", [])
                     if relative not in directories:
@@ -726,7 +762,7 @@ class AgentManager:
         target = tools.resolve(value)  # Exclusions apply before any access prompt.
         if tools.permitted(target):
             return True
-        folder = target if directory else target.parent
+        folder = target if directory and not target.is_file() else target.parent
         event = await self.event(session, "tool", name="access_directory", input={"path": str(folder)},
                                  state="running", output="", preview=f"Allow file tools to access {folder} for this conversation?\n\nReads may send file contents to your configured model. Edits follow the selected permission mode.")
         if not await self.approve(session, event):
@@ -767,15 +803,34 @@ class AgentManager:
 
     async def summarize_context(self, session, client, url, headers, previous, chunk, preservation_note=""):
         await self.status(session, "compacting")
-        response = await client.post(url, headers=headers, json={
-            "messages": build_summary_messages(previous, chunk, preservation_note),
-            "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
-        })
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            response = await client.post(url, headers=headers, json={
+                "messages": build_summary_messages(previous, chunk, preservation_note),
+                "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
+            })
+            diagnostic = self.settings.redact(response.text)[:1000]
+            if (response.status_code == 429 and retryable_rate_limit(diagnostic)
+                    and attempt < MAX_RATE_LIMIT_RETRIES):
+                try:
+                    retry_payload = response.json()
+                except (json.JSONDecodeError, TypeError):
+                    retry_payload = None
+                delay = retry_after_seconds(response.headers, attempt, retry_payload)
+                await self.event(session, "notice", text=(
+                    f"Databricks rate limited context compaction. Retrying in {delay:g} seconds "
+                    f"({attempt + 1} of {MAX_RATE_LIMIT_RETRIES})."))
+                await asyncio.sleep(delay)
+                continue
+            break
         if response.status_code != 200:
-            raise ValueError(f"Context compaction failed (HTTP {response.status_code}). History is preserved; retry or adjust the context budget in Settings.")
+            suffix = f": {diagnostic}" if diagnostic else "."
+            raise ValueError(f"Context compaction failed (HTTP {response.status_code}){suffix} "
+                             "History is preserved; retry or adjust the context budget in Settings.")
         choices = response.json().get("choices", [])
-        if not choices or choices[0].get("finish_reason") != "stop":
-            raise ValueError("Context compaction did not finish. History is preserved; retry with a larger context budget.")
+        finish_reason = choices[0].get("finish_reason") if choices else None
+        if finish_reason != "stop":
+            raise ValueError(f"Context compaction did not finish (finish reason: {finish_reason or 'unavailable'}). "
+                             "History is preserved; retry with a larger context budget.")
         return visible_text(choices[0].get("message", {}).get("content"))
 
     def start_compaction(self, session_id, preservation_note=""):
@@ -853,10 +908,21 @@ class AgentManager:
                     body, truncated = await error_body_prefix(response)
                     diagnostic = self.settings.redact(body)
                     clipped = truncated or len(diagnostic) > 1000
-                    raise InferenceError(
+                    error = InferenceError(
                         f"Databricks returned HTTP {response.status_code}: {diagnostic[:1000]}"
                         + (" [Error response truncated.]" if clipped else ""),
                         http_error_kind(response.status_code), response.status_code)
+                    # Only a request rejected before its SSE stream began is safe
+                    # to repeat automatically. Partial text and tool fragments are
+                    # never retried because their effects may be ambiguous.
+                    if response.status_code == 429 and retryable_rate_limit(diagnostic):
+                        try:
+                            error.retry_payload = json.loads(body)
+                        except (json.JSONDecodeError, TypeError):
+                            error.retry_payload = None
+                        error.retry_headers = {"retry-after": response.headers.get("retry-after")}
+                        error.retryable = True
+                    raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
                         break
@@ -1007,13 +1073,33 @@ class AgentManager:
                 payload = {"messages": messages,
                            "tools": definitions, "stream": True, "max_tokens": max_output_tokens}
                 try:
-                    ordered_calls, arguments = await self.model_response(session, event, client, url, headers, payload)
+                    for rate_attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+                        try:
+                            ordered_calls, arguments = await self.model_response(
+                                session, event, client, url, headers, payload)
+                            break
+                        except InferenceError as exc:
+                            if not getattr(exc, "retryable", False) or rate_attempt >= MAX_RATE_LIMIT_RETRIES:
+                                raise
+                            delay = retry_after_seconds(
+                                getattr(exc, "retry_headers", {}), rate_attempt,
+                                getattr(exc, "retry_payload", None))
+                            await self.update_event(
+                                session, event,
+                                request_info={"model": session["model"], "status": "running"})
+                            await self.event(session, "notice", text=(
+                                f"Databricks rate limited the model request. Retrying in {delay:g} seconds "
+                                f"({rate_attempt + 1} of {MAX_RATE_LIMIT_RETRIES})."))
+                            await asyncio.sleep(delay)
                 except InferenceError as exc:
                     if exc.kind != "output_limit":
                         raise
                     has_another_step = step_index + 1 < steps
                     if consecutive_output_retries < MAX_OUTPUT_LIMIT_RETRIES and has_another_step:
                         consecutive_output_retries += 1
+                        await self.update_event(
+                            session, event,
+                            request_info={**event["request_info"], "status": "interrupted"})
                         wire.append({"role": "user", "content": OUTPUT_LIMIT_CONTINUATION})
                         self.store.save(session)
                         await self.event(

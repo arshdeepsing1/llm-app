@@ -184,6 +184,17 @@ def test_search_literal_regex_case_and_unicode(tmp_path):
     assert [m["line"] for m in tools.search_files("STRASSE", regex=True)["matches"]] == [5]
 
 
+def test_search_accepts_a_single_file_path_and_honors_glob(tmp_path):
+    target = tmp_path / "sample.txt"
+    target.write_text("first\nneedle\nlast\n")
+    tools = WorkspaceTools(str(tmp_path))
+    result = tools.search_files("needle", path="sample.txt", context_lines=1)
+    assert result["matches"] == [{"path": "sample.txt", "line": 2, "text": "needle",
+                                   "before": [{"line": 1, "text": "first"}],
+                                   "after": [{"line": 3, "text": "last"}], "text_truncated": False}]
+    assert tools.search_files("needle", glob="*.py", path="sample.txt")["matches"] == []
+
+
 def test_search_context_and_deterministic_pagination(tmp_path):
     (tmp_path / "b.txt").write_text("first\nneedle b\nlast\n")
     (tmp_path / "a.txt").write_text("first\nneedle a\nlast\n")

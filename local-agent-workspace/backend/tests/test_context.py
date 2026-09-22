@@ -6,7 +6,7 @@ import pytest
 
 from local_agent.context import (
     DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, REPLY_RESERVE,
-    SAFETY_MARGIN, SUMMARY_MAX_BYTES, SUMMARY_PREFIX, build_summary_messages,
+    SAFETY_MARGIN, SUMMARY_MAX_BYTES, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX, build_summary_messages,
     context_breakdown, context_messages, estimate_tokens, prepare_context,
 )
 
@@ -113,6 +113,37 @@ async def test_dynamic_reply_reserve_is_budgeted_without_mutating_wire():
     assert info["estimated_tokens"] == estimate_tokens(messages, TOOLS)
 
 
+async def test_summary_chunks_use_dedicated_budget_when_main_reply_reserve_is_large():
+    wire = [user("old " * 30000), assistant("Old work done."), user("Latest request")]
+    reply_reserve = 25000
+    main_input_budget = COMPACTION_CONTEXT_WINDOW - reply_reserve - SAFETY_MARGIN
+    summary_input_budget = COMPACTION_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - SAFETY_MARGIN
+    request_sizes = []
+
+    async def summarize(previous, chunk):
+        request_sizes.append(estimate_tokens(build_summary_messages(previous, chunk)))
+        return "Earlier work summarized."
+
+    _, state, info = await prepare_context(
+        wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize,
+        reply_reserve=reply_reserve)
+
+    assert state["compactions"] == 1
+    assert info["input_budget"] == main_input_budget
+    assert request_sizes and max(request_sizes) <= summary_input_budget
+    assert max(request_sizes) > main_input_budget
+    assert len(request_sizes) < 10
+
+
+async def test_summary_failure_preserves_provider_detail():
+    async def summarize(previous, chunk):
+        raise ValueError("Context compaction failed (HTTP 429): input token rate limit")
+
+    with pytest.raises(ValueError, match=r"HTTP 429.*input token rate limit"):
+        await prepare_context(long_history(), {}, SYSTEM, TOOLS,
+                              COMPACTION_CONTEXT_WINDOW, summarize)
+
+
 async def test_compaction_keeps_latest_two_turns_and_complete_tool_exchanges():
     wire = long_history()
     wire[3:4] = [
@@ -206,10 +237,11 @@ async def test_unicode_and_escaped_chunks_fit_each_summary_request():
     wire = [user('汉字🙂\\"\n' * 2500), assistant("done"), user("recent"), assistant("answer"), user("latest")]
     state = {"summary": "Earlier summary", "through": 0, "compactions": 2}
     chunks = []
-    input_budget = MIN_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN
+    main_input_budget = MIN_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN
+    summary_input_budget = MIN_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - SAFETY_MARGIN
 
     async def summarize(previous, chunk):
-        assert estimate_tokens(build_summary_messages(previous, chunk)) <= input_budget
+        assert estimate_tokens(build_summary_messages(previous, chunk)) <= summary_input_budget
         chunk.encode("utf-8").decode("utf-8")
         chunks.append(chunk)
         return '事实🙂\\"\n' * 250
@@ -218,7 +250,7 @@ async def test_unicode_and_escaped_chunks_fit_each_summary_request():
     assert len(chunks) > 1
     assert "".join(chunks) == json.dumps(wire[:2], ensure_ascii=False)
     assert updated["compactions"] == 3
-    assert estimate_tokens(messages, TOOLS) == info["estimated_tokens"] <= input_budget
+    assert estimate_tokens(messages, TOOLS) == info["estimated_tokens"] <= main_input_budget
 
 
 async def test_repeated_compaction_only_summarizes_newly_archived_messages():
