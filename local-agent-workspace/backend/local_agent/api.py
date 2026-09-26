@@ -67,6 +67,7 @@ class SettingsEdit(BaseModel):
     context_window: int | None = Field(default=None, ge=MIN_CONTEXT_WINDOW, le=MAX_CONTEXT_WINDOW, strict=True)
     max_output_tokens: int | None = Field(default=None, ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
     max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
+    compaction_handoffs: bool | None = Field(default=None, strict=True)
 
 
 class CommandRequest(BaseModel):

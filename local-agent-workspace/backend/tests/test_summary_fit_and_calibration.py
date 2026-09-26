@@ -236,7 +236,8 @@ def runtime(tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()
     settings = Settings(tmp_path / "state")
-    settings.values.update(workspace=str(project), env_file="", context_window=WINDOW)
+    # These tests cover summary fitting; test_compaction_handoffs covers handoff mode.
+    settings.values.update(workspace=str(project), env_file="", context_window=WINDOW, compaction_handoffs=False)
     settings.credentials = lambda: ("https://gateway.example", "test-token")
     store = Store(settings.state_dir / "tests.sqlite3")
     manager = AgentManager(store, settings)

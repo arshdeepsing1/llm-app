@@ -9,7 +9,8 @@ from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.context import (
-    MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS, build_summary_messages, estimate_tokens, prepare_context,
+    DEFAULT_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS, build_summary_messages, estimate_tokens,
+    handoff_output_tokens, prepare_context,
 )
 from local_agent.instructions import load_project_instructions
 from local_agent.store import Store
@@ -69,7 +70,9 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
         call = manager.store.get(session["id"])["inference_calls"][-1]
         assert call["purpose"] == "compaction" and call["status"] == "running"
         assert payload["stream"] is False and "tools" not in payload
-        assert payload["max_tokens"] == SUMMARY_MAX_TOKENS
+        # Compaction handoffs are on by default: the request asks for a detailed handoff.
+        assert payload["max_tokens"] == handoff_output_tokens(DEFAULT_CONTEXT_WINDOW)
+        assert payload["messages"][0]["content"].startswith("Write a detailed handoff document")
         assert "Preserve migration decisions" in payload["messages"][1]["content"]
         return httpx.Response(200, json={
             "choices": [{"message": {"content": "Migration completed and must remain compatible."},
@@ -101,6 +104,11 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
     assert saved["context_state"]["through"] == 2
     assert saved["context_state"]["compactions"] == 3
     assert saved["context_info"]["prepared_for_next_turn"] is True
+    handoffs = list((project / "handoffs" / "auto").glob("*-compaction-3.md"))
+    assert len(handoffs) == 1 and "Migration completed and must remain compatible." in handoffs[0].read_text()
+    assert saved["context_state"]["handoff_files"] == [
+        {"path": f"handoffs/auto/{handoffs[0].name}", "compaction": 3}]
+    assert any("Saved a detailed handoff" in event.get("text", "") for event in saved["events"])
     assert [(call["purpose"], call["status"], call["usage"])
             for call in saved["inference_calls"]] == [
                 ("compaction", "completed", {"input_tokens": 120, "output_tokens": 16})]
@@ -116,6 +124,8 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
 @pytest.mark.parametrize("failure", ["http", "empty", "length", "cancel"])
 async def test_manual_failure_or_stop_keeps_previous_summary_and_archive(runtime, monkeypatch, failure):
     manager, session, _ = runtime
+    # A cut-off summary fails compaction; a cut-off handoff is kept (see test_compaction_handoffs).
+    manager.settings.values["compaction_handoffs"] = failure != "length"
     original = copy.deepcopy(session)
     entered = asyncio.Event()
 

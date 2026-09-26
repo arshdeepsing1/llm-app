@@ -399,6 +399,25 @@ summary, asks the model to condense it. If condensing fails or is still too long
 app keeps the start and end of the summary and omits part of the middle. Either case
 adds a visible notice and is shown in context details. These summary limits are
 separate from the main reply limit and total context budget.
+
+**Settings → Save a detailed handoff at each compaction** is on by default. Each
+automatic or manual compaction then asks the model for a detailed Markdown handoff of
+the turns being summarized (status, decisions, issues and fixes, file changes, key
+facts, open items, next actions) instead of the short summary. The same request that
+already carried those turns writes it, so no extra conversation is resent; it may use
+up to an eighth of the context budget in output tokens (16,000 with the default
+budget), and a non-streamed reply can take a few minutes. A small follow-up request
+condenses the handoff into the in-context summary. The app saves the handoff, with a
+generated activity log of every command and file, to
+`<workspace>/handoffs/auto/<date>-<chat-title>-compaction-<N>.md`, adding a suffix
+instead of overwriting an existing file. After compaction, the summary message lists
+the newest five saved handoffs so the model can read the relevant section with
+`read_file` or `search_files` when it needs details the summary omits. A handoff cut
+off at its output limit is still saved and used, with a note. If the file cannot be
+written (for example, the folder resolves outside the workspace), a notice explains
+it and compaction continues with the summary only. Subagent conversations do not
+write compaction handoffs. Turn the setting off for the previous summary-only
+compaction.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
@@ -534,8 +553,9 @@ send `/skill handoff Create a handoff for this conversation`. It asks for a cold
 document in the style of a long working-session memory file, written in parts of
 about 20 KB so no single response hits the output limit, and ends by calling
 `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
-The skill uses 5.4 KB of the 8 KB skill budget. Write a handoff before the context
-meter nears its limit: once turns are compacted, the model sees only their summary.
+The skill uses 5.4 KB of the 8 KB skill budget. Automatic compaction handoffs (see
+Context and project instructions) are written from the turns being compacted; use the
+skill when you want a curated handoff, for example before ending a session.
 
 The model receives the current local date, time, and timezone with each request, so
 handoffs and file names use the real date. Its instructions keep chat replies concise

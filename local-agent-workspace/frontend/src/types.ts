@@ -2,7 +2,7 @@ export type PermissionMode = 'manual' | 'auto' | 'acceptEdits' | 'plan' | 'bypas
 export type ToolProfile = 'inherit' | 'read_only' | 'file_editor'
 export type Settings = {
   workspace: string; model: string; env_file: string; context_window: number;
-  max_output_tokens: number; max_agent_steps: number;
+  max_output_tokens: number; max_agent_steps: number; compaction_handoffs?: boolean;
   host: string; configured: boolean;
 }
 export type Connection = { connected: boolean; models: string[]; error: string | null }

@@ -1,21 +1,24 @@
 import asyncio
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 
 from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .permissions import BASIC_COMMANDS, COMMAND_TOOLS, mode_prompt, tool_decision
-from .activity import ACTIVITY_TOOL, activity_content
+from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, SUMMARY_MAX_TOKENS,
-    build_condense_messages, build_summary_messages, estimate_scale, estimate_tokens,
-    prepare_context, summary_byte_limit,
+    build_condense_messages, build_handoff_messages, build_summary_messages, estimate_scale, estimate_tokens,
+    handoff_output_tokens, prepare_context, summary_byte_limit,
 )
+from .tools import LIMIT as FILE_LIMIT
 from .config import DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
@@ -37,6 +40,7 @@ from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
+HANDOFF_FOLDER = "handoffs/auto"
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_RETRY_DELAYS = (5.0, 15.0, 40.0)
 OUTPUT_LIMIT_HISTORY_PLACEHOLDER = (
@@ -837,20 +841,26 @@ class AgentManager:
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")}
         return system, guidance
 
-    async def summarize_context(self, session, client, url, headers, messages):
+    async def summarize_context(self, session, client, url, headers, messages, *, max_tokens=SUMMARY_MAX_TOKENS,
+                                keep_truncated=False):
+        """One compaction request. keep_truncated keeps a handoff cut off at its
+        output limit: the large, already-billed text is still useful."""
         await self.status(session, "compacting")
         estimated_input_tokens = estimate_tokens(messages)
+        # A non-streamed handoff can take minutes to generate; Databricks allows
+        # up to 597 seconds per request.
+        timeout = httpx.Timeout(600, connect=20) if max_tokens > SUMMARY_MAX_TOKENS else None
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
             call = begin_inference_call(
-                session, "compaction", session["model"], max_output_tokens=SUMMARY_MAX_TOKENS,
+                session, "compaction", session["model"], max_output_tokens=max_tokens,
                 attempt=attempt + 1, estimated_input_tokens=estimated_input_tokens)
             # Persist the attempt before provider admission so an abrupt process
             # exit cannot erase a request that Databricks may already have billed.
             self.store.save(session)
             try:
                 response = await client.post(url, headers=headers, json={
-                    "messages": messages, "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
-                })
+                    "messages": messages, "stream": False, "max_tokens": max_tokens,
+                }, **({"timeout": timeout} if timeout else {}))
                 info = {"status": "running", "http_status": response.status_code}
                 try:
                     payload = response.json()
@@ -880,6 +890,13 @@ class AgentManager:
                 choices = payload.get("choices", [])
                 finish_reason = choices[0].get("finish_reason") if choices and isinstance(choices[0], dict) else None
                 info["finish_reason"] = finish_reason or "unavailable"
+                if finish_reason == "length" and keep_truncated:
+                    text = visible_text(choices[0].get("message", {}).get("content"))
+                    if isinstance(text, str) and text.strip():
+                        info["status"] = "completed"
+                        finish_inference_call(call, info)
+                        self.store.save(session)
+                        return text.rstrip() + "\n\n[This handoff was cut off at the output limit.]"
                 if finish_reason != "stop":
                     info.update(status="error", error_kind=(
                         "output_limit" if finish_reason == "length" else "incomplete_response"))
@@ -906,9 +923,15 @@ class AgentManager:
                     self.store.save(session)
                 raise
 
-    def compaction_requests(self, session, client, url, headers, preservation_note=""):
-        """Summary and condense callbacks for prepare_context, sharing one client."""
+    def compaction_requests(self, session, client, url, headers, preservation_note="", handoff_tokens=None):
+        """Summary and condense callbacks for prepare_context, sharing one client.
+
+        With handoff_tokens, the summary request writes a detailed handoff instead.
+        """
         async def summarize(previous, chunk, limit_bytes):
+            if handoff_tokens:
+                return await self.summarize_context(session, client, url, headers, build_handoff_messages(
+                    previous, chunk, preservation_note, handoff_tokens), max_tokens=handoff_tokens, keep_truncated=True)
             return await self.summarize_context(session, client, url, headers, build_summary_messages(
                 previous, chunk, preservation_note, limit_bytes))
 
@@ -918,7 +941,59 @@ class AgentManager:
 
         return summarize, condense
 
+    def handoff_plan(self, session, context_window):
+        """Where the next compaction saves its handoff, or None when disabled."""
+        if not self.settings.values.get("compaction_handoffs", True) or session.get("is_subagent"):
+            return None
+        state = session.get("context_state") or {}
+        slug = re.sub(r"[^a-z0-9]+", "-", str(session.get("title") or "").lower()).strip("-")[:60].strip("-") or "chat"
+        stem = f"{datetime.now():%Y-%m-%d}-{slug}-compaction-{state.get('compactions', 0) + 1}"
+        folder = Path(session["workspace"]) / HANDOFF_FOLDER
+        for suffix in ("", f"-{session['id'][:8]}", *(f"-{session['id'][:8]}-{n}" for n in range(2, 50))):
+            if not (folder / f"{stem}{suffix}.md").exists():
+                return {"path": f"{HANDOFF_FOLDER}/{stem}{suffix}.md", "tokens": handoff_output_tokens(context_window)}
+        return None
+
+    def handoff_saver(self, session, plan):
+        async def save(documents, compaction):
+            try:
+                root = Path(session["workspace"]).resolve()
+                target = root / plan["path"]
+                # Check before and after creating folders: a symlinked handoffs
+                # folder must not redirect the write outside the workspace.
+                for created in (False, True):
+                    if not target.parent.resolve().is_relative_to(root):
+                        raise ValueError("the handoff folder resolves outside the workspace")
+                    if not created:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                clean = lambda text: self.settings.redact(redact_secrets(text))
+                parts = documents if len(documents) == 1 else [
+                    f"## Part {index} of {len(documents)}\n\n{document}" for index, document in enumerate(documents, 1)]
+                body = (f"# Handoff: {clean(str(session.get('title') or 'Conversation'))} (compaction {compaction})\n\n"
+                        f"Written automatically by the app at {local_time(time.time())} when conversation "
+                        f"`{session['id']}` was compacted. The model wrote the sections below from the turns being "
+                        "summarized; the activity log at the end is generated by the app.\n\n"
+                        + clean("\n\n".join(parts)).rstrip() + "\n\n")
+                budget = FILE_LIMIT - len(body.encode("utf-8"))
+                log, _ = activity_log(session, [*session.get("command_jobs", []), *self.jobs.list(session_id=session["id"])],
+                                      redact=self.settings.redact, max_bytes=budget) if budget >= 1000 else (
+                    "_Activity log omitted: this handoff already fills the 80 KB file limit. Use insert_activity_log "
+                    "with a separate file to record every command._\n", None)
+                with open(target, "x", encoding="utf-8") as handle:
+                    handle.write(body + log)
+                return True
+            except (OSError, ValueError) as exc:
+                await self.event(session, "notice", text=self.settings.redact(
+                    f"Could not save the compaction handoff to {plan['path']}: {exc}. Compaction continues without it."))
+                return False
+        return save
+
     async def summary_adjustment_notice(self, session, info):
+        if info.get("handoff_path"):
+            await self.event(session, "notice", text=(
+                f"Saved a detailed handoff of the summarized turns to {info['handoff_path']} in the workspace."))
+            if info.get("summary_adjustment") == "condensed":
+                return  # Expected: the handoff is condensed into the in-context summary.
         adjustment = info.get("summary_adjustment")
         if not adjustment:
             return
@@ -967,14 +1042,17 @@ class AgentManager:
                 warnings.append("No saved tool definitions: this preview includes built-in tools only. External tool costs refresh on the next model request.")
             url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
             headers = {"Authorization": f"Bearer {token}"}
+            context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
+            plan = self.handoff_plan(session, context_window)
             async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
-                summarize, condense = self.compaction_requests(session, client, url, headers, preservation_note)
+                summarize, condense = self.compaction_requests(
+                    session, client, url, headers, preservation_note, plan and plan["tokens"])
                 _, updated, info = await prepare_context(
-                    model_history(session["wire"]), state, system, definitions,
-                    self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW), summarize,
+                    model_history(session["wire"]), state, system, definitions, context_window, summarize,
                     reply_reserve=self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
                     force_compact=True, preservation_note=preservation_note, condense=condense,
-                    scale=estimate_scale(session.get("inference_calls"), session["model"]))
+                    scale=estimate_scale(session.get("inference_calls"), session["model"]),
+                    handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan))
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True}
             prepared = {**session, "context_state": updated, "context_info": info}
@@ -1162,16 +1240,19 @@ class AgentManager:
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
-            summarize, condense = self.compaction_requests(session, client, url, headers)
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             consecutive_output_retries = 0
             for step_index in range(steps):
                 system, guidance = self.context_inputs(session, tools, mode)
+                plan = self.handoff_plan(session, context_window)
+                summarize, condense = self.compaction_requests(session, client, url, headers,
+                                                               handoff_tokens=plan and plan["tokens"])
                 messages, next_context, info = await prepare_context(
                     model_history(wire), context_state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, condense=condense,
-                    scale=estimate_scale(session.get("inference_calls"), session["model"]))
+                    scale=estimate_scale(session.get("inference_calls"), session["model"]),
+                    handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan))
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"]}
