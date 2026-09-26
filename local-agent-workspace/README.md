@@ -307,7 +307,7 @@ cannot be reconstructed. A delegated child's requests stay in its own conversati
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below remains a separate
-pre-request estimate even when reported usage is available.
+pre-request estimate, but reported input tokens calibrate it (see below).
 
 Every chat, title, and summary call is sent to
 `DBRICKS_URL/serving-endpoints/<selected endpoint>/invocations`; the app does not
@@ -317,6 +317,42 @@ section for immediate per-conversation telemetry,
 [`system.ai_gateway.usage`](https://docs.databricks.com/aws/en/ai-gateway/usage-tracking)
 for workspace/account observability, and [`system.billing.usage`](https://docs.databricks.com/aws/en/ai-gateway/cost-observability)
 for billable usage. Those surfaces have different scopes and update timing.
+
+**Correlating usage with the conversation file.** Each Usage row is one
+`inference_call` record in `<state dir>/conversations/<conversation-id>.jsonl`.
+An agent call's `event_id` names the assistant reply it produced; the tool events
+that follow that reply are the tools it called; a retried request repeats the
+`event_id` with the next `attempt`. Title and compaction calls have no `event_id`.
+**Export CSV** in the Usage section downloads one row per call with local and UTC
+times, tokens, the DBU estimate, the reply excerpt, the tools it called, and the
+IDs below. The same rows are available offline with
+`python3 scripts/usage_report.py <conversation file>.jsonl [--csv usage.csv]`
+(Python 3 only; copy the file first if the app is running). Excerpts pass through
+the same credential redaction as other exports; cells that a spreadsheet would run
+as formulas are prefixed with `'`.
+
+Every request carries a `Databricks-Ai-Gateway-Request-Tags` header with
+`local_agent_call_id` (the ledger record id), `local_agent_conversation`, and
+`local_agent_purpose`. Databricks documents storing these tags in the
+`request_tags` column of `system.ai_gateway.usage`, so where your endpoint's usage
+is recorded there you can join exactly:
+
+```sql
+SELECT event_time, request_tags['local_agent_call_id'] AS call_id,
+       input_tokens, output_tokens, status_code
+FROM system.ai_gateway.usage
+WHERE request_tags['local_agent_conversation'] = '<conversation id>'
+ORDER BY event_time;
+```
+
+Whether a given `/serving-endpoints/.../invocations` endpoint is tracked in that
+table depends on its Databricks gateway configuration; the legacy
+`system.serving.endpoint_usage` table has no field this app sets (the Foundation
+Model API does not document `client_request_id` or `usage_context` for chat
+requests, so the app does not send them). Match there on endpoint, `request_time`
+within a few seconds of `started_utc`, and the exact token counts. The ledger also
+keeps each response's `id` as `response_id` (Databricks encrypts it) for support
+requests.
 For chat and context-summary calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response
 received before streaming begins is retried at most three times. The app honors numeric or HTTP-date `Retry-After`
 headers and root/nested JSON `retry_after` values, capped at 60 seconds; otherwise
@@ -347,6 +383,16 @@ three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
 overhead. This heuristic varies from the actual model tokenizer and is not a
 guaranteed upper bound, provider usage, or billing data. Older saved byte-based
 meters refresh on the next request.
+Each agent and summary request records this unscaled estimate in the usage ledger.
+When Databricks reports input tokens, later estimates for the same conversation and
+model are multiplied by the ratio of reported to estimated input tokens across up to
+the five most recent completed requests of at least 1,000 estimated tokens (cache
+read/write tokens are added to input tokens). The scale only raises the heuristic,
+never lowers it, and is capped at 2×. In one observed code-heavy chat, Claude
+reported about 26% more input tokens than the heuristic; a scale of about 1.26 makes
+automatic compaction start before the real request outgrows the context budget.
+Context details show the applied scale. A conversation's first request to a model,
+or older requests recorded before this calibration, use the unscaled heuristic.
 Expanded context details attribute that same estimate to system/project
 instructions (including selected skills), tool definitions, conversation messages
 and tool results, the retained summary, and request framing/rounding overhead.
@@ -381,8 +427,33 @@ When older turns no longer fit, the same endpoint summarizes them in bounded
 requests with at most 4,096 output tokens per summary request. Summary chunks use
 that independent reply reserve instead of the main response reserve, so increasing
 the main output setting does not multiply the number of compaction requests. The
-retained summary must also fit within 3,500 UTF-8 bytes; that byte cap is not a token count. These
-summary limits are separate from the main reply limit and total context budget.
+retained summary may use about an eighth of the input budget, between 3,500 and
+12,000 UTF-8 bytes (12,000 with the default settings); that byte cap is not a token
+count. A summary that comes back longer is not discarded, because producing it may
+have required a large billed request: a small extra request, containing only that
+summary, asks the model to condense it. If condensing fails or is still too long, the
+app keeps the start and end of the summary and omits part of the middle. Either case
+adds a visible notice and is shown in context details. These summary limits are
+separate from the main reply limit and total context budget.
+
+**Settings → Save a detailed handoff at each compaction** is on by default. Each
+automatic or manual compaction then asks the model for a detailed Markdown handoff of
+the turns being summarized (status, decisions, issues and fixes, file changes, key
+facts, open items, next actions) instead of the short summary. The same request that
+already carried those turns writes it, so no extra conversation is resent; it may use
+up to an eighth of the context budget in output tokens (16,000 with the default
+budget), and a non-streamed reply can take a few minutes. A small follow-up request
+condenses the handoff into the in-context summary. The app saves the handoff, with a
+generated activity log of every command and file, to
+`<workspace>/handoffs/auto/<date>-<chat-title>-compaction-<N>.md`, adding a suffix
+instead of overwriting an existing file. After compaction, the summary message lists
+the newest five saved handoffs so the model can read the relevant section with
+`read_file` or `search_files` when it needs details the summary omits. A handoff cut
+off at its output limit is still saved and used, with a note. If the file cannot be
+written (for example, the folder resolves outside the workspace), a notice explains
+it and compaction continues with the summary only. Subagent conversations do not
+write compaction handoffs. Turn the setting off for the previous summary-only
+compaction.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
@@ -390,8 +461,12 @@ in that conversation's JSONL file. Summary requests are additional billed infere
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
 If the latest turn, tool output, or project guidance alone is too large, the app
-reports an error instead of silently cutting it. Increase the budget only within
-your endpoint's limit, or start a new conversation with a smaller request. There
+reports an error instead of silently cutting it. The error states the estimated
+tokens needed and the input-budget arithmetic (context budget minus Max output
+tokens minus the 2,048-token safety margin). When Max output tokens is above the
+8,192 default, it suggests lowering that first: for example, 131,000 context with
+121,000 reserved for output leaves only 7,952 input tokens. Otherwise, increase the
+budget only within your endpoint's limit, or start a new conversation with a smaller request. There
 is no model tokenizer integration. Retained job output is paginated; discarded
 process output cannot be recovered.
 
@@ -506,6 +581,40 @@ before a write, command, or MCP call. At most three selected skills fit a combin
 8 KB instruction budget. Skills never override user instructions or permissions;
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
+
+The app ships a detailed handoff skill at `skills/handoff/SKILL.md`. To use it, copy
+it to `<chat workspace>/.agents/skills/handoff/SKILL.md` (for example
+`Local_Code/.agents/skills/handoff/SKILL.md`), reopen **Agent tools → Extensions**, and
+send `/skill handoff Create a handoff for this conversation`. It asks for a cold-start
+document in the style of a long working-session memory file, written in parts of
+about half the file text one response can hold (about 20 KB at 20,000 Max output
+tokens, about 8 KB at the 8,192 default) so no single response hits the output limit,
+and ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
+The skill uses 5.4 KB of the 8 KB skill budget. Automatic compaction handoffs (see
+Context and project instructions) are written from the turns being compacted; use the
+skill when you want a curated handoff, for example before ending a session.
+
+The model receives the current local date, time, and timezone with each request, so
+handoffs and file names use the real date. It is also told its per-response output
+limit from **Max output tokens** and the approximate file text that fits (about 2 KB
+per 1,000 tokens), so long files are split into parts that finish in one response. Its instructions keep chat replies concise
+but ask for complete requested documents, split into parts rather than shortened.
+
+`insert_activity_log` inserts an exact, app-generated Markdown log of the
+conversation's commands (with results and exit codes), files created, edited, read,
+listed, or searched, declined or failed actions, and other tool-call counts. The app
+builds it from the saved display history, so it covers compacted turns and costs no
+output tokens; the model receives only a short summary. It replaces the line
+`<!-- activity-log -->` when the file has exactly one, and otherwise appends. It runs
+as a `write_file` with generated content: the same permission modes, folder access,
+approval diff, file checkpoint, and `write_file` hooks apply (Plan mode blocks it).
+Commands are copied as they ran except that the app's configured credentials and
+common secret shapes (GitHub and Databricks tokens, AWS access keys, bearer tokens,
+`password=`/`token=`-style values, and URL passwords) are replaced with `[REDACTED]`;
+review the file before sharing it. The finished file must stay within 80 KB: the
+oldest commands are omitted with a note when needed, so insert the log into a
+separate file to keep every command. Delegated subagent conversations keep their own
+logs.
 
 Tool arguments are validated against their advertised JSON Schema before approvals,
 hooks, or execution, then pass the existing semantic/path checks. Validation is
@@ -710,7 +819,10 @@ bundle after starting the backend, restart the backend to register static assets
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
+- `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
+- `skills/handoff/SKILL.md`: detailed handoff skill to copy into a workspace's `.agents/skills/handoff/`.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
+- `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.

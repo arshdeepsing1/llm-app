@@ -21,7 +21,8 @@ export default function ContextMeter({ info, busy = false, onCompact }: {
     <div className="context-details">
       {legacyEstimate ? <p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p> : <>
         <p>Approximately {info.estimated_tokens.toLocaleString()} of {info.input_budget.toLocaleString()} input tokens used.</p>
-        <p>Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model. {info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
+        <p>{info.estimate_scale ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)} to match the input tokens Databricks reported for recent requests to this model. Not billing usage.` : 'Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model.'} {info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
+        {info.summary_adjustment ? <p>{info.summary_adjustment === 'condensed' ? 'The latest conversation summary was over its size limit and was condensed by a short extra request.' : 'The latest conversation summary was over its size limit and part of it was omitted.'} Full history is preserved.</p> : null}
       </>}
       {!legacyEstimate && info.breakdown ? <>
         <p className="context-heading">Approximate input breakdown</p>

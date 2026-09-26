@@ -2,7 +2,7 @@ export type PermissionMode = 'manual' | 'auto' | 'acceptEdits' | 'plan' | 'bypas
 export type ToolProfile = 'inherit' | 'read_only' | 'file_editor'
 export type Settings = {
   workspace: string; model: string; env_file: string; context_window: number;
-  max_output_tokens: number; max_agent_steps: number;
+  max_output_tokens: number; max_agent_steps: number; compaction_handoffs?: boolean;
   host: string; configured: boolean;
 }
 export type Connection = { connected: boolean; models: string[]; error: string | null }
@@ -53,6 +53,7 @@ export type ContextInfo = {
   instruction_sources?: { path: string; scope: string; status: 'loaded' | 'omitted'; estimated_tokens: number; reason?: string }[];
   prepared_for_next_turn?: boolean;
   breakdown?: { system_instructions: number; tool_definitions: number; messages_and_results: number; summary: number; request_overhead: number };
+  estimate_scale?: number; summary_adjustment?: 'condensed' | 'trimmed';
 }
 export type Session = {
   id: string; title: string; workspace: string; model: string;

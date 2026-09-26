@@ -98,3 +98,16 @@ it('disables compaction while busy and labels the prepared context as a preview'
   fireEvent.click(screen.getByRole('button', { name: 'Compact now' }))
   expect(onCompact).not.toHaveBeenCalled()
 })
+
+it('explains a calibrated estimate and a condensed or trimmed summary', () => {
+  const view = render(<ContextMeter info={{ ...contextInfo, estimated_tokens: 12650, estimate_scale: 1.25, summary_adjustment: 'condensed' }} />)
+  fireEvent.click(screen.getByText('Last model input · ~10%'))
+  expect(screen.getByText(/scaled ×1\.25 to match the input tokens Databricks reported/)).toBeTruthy()
+  expect(screen.queryByText(/Heuristic text-size estimate/)).toBeNull()
+  expect(screen.getByText(/condensed by a short extra request\. Full history is preserved\./)).toBeTruthy()
+  view.rerender(<ContextMeter info={{ ...contextInfo, summary_adjustment: 'trimmed' }} />)
+  expect(screen.getByText(/Heuristic text-size estimate/)).toBeTruthy()
+  expect(screen.getByText(/part of it was omitted\. Full history is preserved\./)).toBeTruthy()
+  view.rerender(<ContextMeter info={contextInfo} />)
+  expect(screen.queryByText(/over its size limit/)).toBeNull()
+})

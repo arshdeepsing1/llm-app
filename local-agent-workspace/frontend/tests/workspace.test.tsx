@@ -210,7 +210,8 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
   expect(dialog.getByText(/not individual tool calls/)).toBeTruthy()
   expect(dialog.queryByLabelText('Agent runtime')).toBeNull()
   expect(dialog.queryByText(/Claude|MCP|skills/i)).toBeNull()
-  expect(dialog.queryByRole('checkbox')).toBeNull()
+  // No runtime or skill options remain; the only switch is compaction handoffs.
+  expect(dialog.getAllByRole('checkbox').map(box => box.closest('label')?.textContent)).toEqual(['Save a detailed handoff at each compaction'])
   fireEvent.change(dialog.getByLabelText('Project folder'), { target: { value: '/updated-project' } })
   fireEvent.change(dialog.getByLabelText('Databricks model endpoint'), { target: { value: 'databricks-gpt-oss-120b' } })
   fireEvent.change(dialog.getByLabelText('Credential file'), { target: { value: '/credentials/env_vars.txt' } })
@@ -224,6 +225,20 @@ it('opens Databricks-only settings and saves only the editable Databricks fields
     workspace: '/updated-project', model: 'databricks-gpt-oss-120b', env_file: '/credentials/env_vars.txt',
     context_window: 65536, max_output_tokens: 32768, max_agent_steps: 48,
   })
+})
+
+it('turns compaction handoffs off and sends the choice only when set', async () => {
+  await renderApp()
+  fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+  const dialog = within(await screen.findByRole('dialog'))
+  const toggle = dialog.getByRole<HTMLInputElement>('checkbox', { name: 'Save a detailed handoff at each compaction' })
+  expect(toggle.checked).toBe(true)
+  fireEvent.click(toggle)
+  expect(toggle.checked).toBe(false)
+  fireEvent.click(dialog.getByRole('button', { name: 'Save settings' }))
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  const request = fetchMock.mock.calls.find(([path, options]) => path === '/api/settings' && options?.method === 'PUT')
+  expect(JSON.parse(request![1]!.body as string)).toMatchObject({ compaction_handoffs: false })
 })
 
 describe('conversation renaming', () => {

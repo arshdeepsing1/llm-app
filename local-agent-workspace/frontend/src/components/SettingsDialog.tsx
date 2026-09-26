@@ -34,6 +34,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Agent steps per message<input type="number" required min={1} max={64} step={1}
           value={form.max_agent_steps || ''} onChange={e => setForm(current => ({ ...current, max_agent_steps: Number(e.target.value) }))} /></label>
         <p className="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
+        <label className="settings-checkbox"><input type="checkbox" checked={form.compaction_handoffs !== false}
+          onChange={e => setForm(current => ({ ...current, compaction_handoffs: e.target.checked }))} />Save a detailed handoff at each compaction</label>
+        <p className="field-help">When earlier turns are compacted, the model writes a detailed handoff (up to 16,000 output tokens) that the app saves to handoffs/auto/ in the project folder with an exact log of every command. The model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.</p>
         <label>Credential file<input value={form.env_file} onChange={e => field('env_file', e.target.value)} placeholder="/path/to/env_vars.txt" /></label>
         <p className="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>
         <p className="settings-note">Project and model changes apply to new conversations. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>

@@ -60,6 +60,7 @@ class Settings:
             "context_window": DEFAULT_CONTEXT_WINDOW,
             "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
             "max_agent_steps": DEFAULT_MAX_AGENT_STEPS,
+            "compaction_handoffs": True,
         }
         if self.path.exists():
             saved = json.loads(self.path.read_text())
@@ -104,6 +105,8 @@ class Settings:
         max_steps = candidate["max_agent_steps"]
         if type(max_steps) is not int or not MIN_MAX_AGENT_STEPS <= max_steps <= MAX_MAX_AGENT_STEPS:
             raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
+        if type(candidate["compaction_handoffs"]) is not bool:
+            raise ValueError("Compaction handoffs must be on or off.")
         candidate["workspace"] = str(workspace)
         self.values = candidate
         temp = self.path.with_suffix(".tmp")

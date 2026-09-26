@@ -26,6 +26,17 @@ export async function api<T>(path: string, method = 'GET', body?: unknown, retri
 export async function apiJsonText<T>(path: string, body: string): Promise<T> {
   return request<T>(path, 'POST', body)
 }
+// Download a non-JSON response (for example a CSV export) with the local token.
+export async function apiText(path: string, retried = false): Promise<string> {
+  const response = await fetch(`/api${path}`, { headers: { 'X-Local-Token': token } })
+  if (response.ok) return response.text()
+  const data = await response.json().catch(() => ({}))
+  if (response.status === 403 && data.code === 'reconnect_required' && !retried) {
+    await refreshToken()
+    return apiText(path, true)
+  }
+  throw new ApiError(typeof data.detail === 'string' ? data.detail : `Request failed with HTTP ${response.status}.`, response.status)
+}
 async function request<T>(path: string, method: string, body?: string, retried = false): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method, headers: { 'Content-Type': 'application/json', 'X-Local-Token': token },

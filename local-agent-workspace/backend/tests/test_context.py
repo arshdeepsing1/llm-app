@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import re
 
 import pytest
 
@@ -29,7 +30,7 @@ def long_history():
             user("Previous request"), assistant("Previous answer"), user("Latest request")]
 
 
-async def forbidden_summary(previous, chunk):
+async def forbidden_summary(previous, chunk, limit_bytes):
     pytest.fail("Summarization should not run")
 
 
@@ -120,8 +121,8 @@ async def test_summary_chunks_use_dedicated_budget_when_main_reply_reserve_is_la
     summary_input_budget = COMPACTION_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - SAFETY_MARGIN
     request_sizes = []
 
-    async def summarize(previous, chunk):
-        request_sizes.append(estimate_tokens(build_summary_messages(previous, chunk)))
+    async def summarize(previous, chunk, limit_bytes):
+        request_sizes.append(estimate_tokens(build_summary_messages(previous, chunk, limit_bytes=limit_bytes)))
         return "Earlier work summarized."
 
     _, state, info = await prepare_context(
@@ -136,7 +137,7 @@ async def test_summary_chunks_use_dedicated_budget_when_main_reply_reserve_is_la
 
 
 async def test_summary_failure_preserves_provider_detail():
-    async def summarize(previous, chunk):
+    async def summarize(previous, chunk, limit_bytes):
         raise ValueError("Context compaction failed (HTTP 429): input token rate limit")
 
     with pytest.raises(ValueError, match=r"HTTP 429.*input token rate limit"):
@@ -158,7 +159,7 @@ async def test_compaction_keeps_latest_two_turns_and_complete_tool_exchanges():
     original = copy.deepcopy((wire, state))
     chunks = []
 
-    async def summarize(previous, chunk):
+    async def summarize(previous, chunk, limit_bytes):
         chunks.append(chunk)
         return "The earlier work is complete."
 
@@ -179,7 +180,7 @@ async def test_compaction_falls_back_to_latest_turn_when_two_do_not_fit():
     wire = long_history()
     wire[2] = user("p" * 70000)
 
-    async def summarize(previous, chunk):
+    async def summarize(previous, chunk, limit_bytes):
         return "Earlier requests summarized."
 
     messages, state, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
@@ -193,9 +194,32 @@ async def test_no_summary_call_when_latest_turn_or_system_cannot_fit(large_syste
     system = {"role": "system", "content": "s" * (90000 if large_system else 10)}
     state = {"summary": "", "through": 0, "compactions": 0}
     original = copy.deepcopy((wire, state))
-    with pytest.raises(ValueError, match="Increase the context window"):
+    with pytest.raises(ValueError, match="Increase the context budget in Settings"):
         await prepare_context(wire, state, system, TOOLS, COMPACTION_CONTEXT_WINDOW, forbidden_summary)
     assert (wire, state) == original
+
+
+async def test_large_output_reserve_error_shows_budget_arithmetic_and_lower_output_advice():
+    # A saved 131,000-token context with a 121,000-token output reserve leaves
+    # only 7,952 input tokens; raising the context by 72 tokens cannot fix that.
+    wire = [user("Read the memory files."), assistant("Reading."), user("Now the Airflow DAGs: " + "x" * 24000)]
+    with pytest.raises(ValueError) as error:
+        await prepare_context(wire, {}, SYSTEM, TOOLS, 131000, forbidden_summary, reply_reserve=121000)
+    message = str(error.value)
+    assert re.search(r"need about [\d,]+ estimated input tokens", message)
+    assert ("The input budget is 7,952 tokens: 131,000 context budget minus 121,000 reserved for output "
+            "minus the 2,048-token safety margin.") in message
+    assert "Lower Max output tokens in Settings (currently 121,000; default 8,192)" in message
+
+
+async def test_default_output_reserve_error_does_not_blame_the_output_setting():
+    wire = [user("old"), assistant("answer"), user("x" * 90000)]
+    with pytest.raises(ValueError) as error:
+        await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, forbidden_summary)
+    message = str(error.value)
+    assert "The input budget is 22,528 tokens: 32,768 context budget minus 8,192 reserved" in message
+    assert "Increase the context budget in Settings" in message
+    assert "Max output tokens" not in message
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("provider failed"), asyncio.CancelledError()])
@@ -206,7 +230,7 @@ async def test_failure_after_first_chunk_never_commits_partial_summary(failure):
     original = copy.deepcopy((wire, state))
     calls = 0
 
-    async def summarize(previous, chunk):
+    async def summarize(previous, chunk, limit_bytes):
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -220,12 +244,12 @@ async def test_failure_after_first_chunk_never_commits_partial_summary(failure):
     assert (wire, state) == original
 
 
-@pytest.mark.parametrize("summary", ["", "  ", None, "x" * (SUMMARY_MAX_BYTES + 1), "🙂" * 876])
-async def test_summary_must_be_nonempty_text_within_byte_limit(summary):
+@pytest.mark.parametrize("summary", ["", "  ", None])
+async def test_summary_must_be_nonempty_text(summary):
     wire, state = long_history(), {}
     original = copy.deepcopy((wire, state))
 
-    async def summarize(previous, chunk):
+    async def summarize(previous, chunk, limit_bytes):
         return summary
 
     with pytest.raises(ValueError, match="summary"):
@@ -240,8 +264,8 @@ async def test_unicode_and_escaped_chunks_fit_each_summary_request():
     main_input_budget = MIN_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN
     summary_input_budget = MIN_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - SAFETY_MARGIN
 
-    async def summarize(previous, chunk):
-        assert estimate_tokens(build_summary_messages(previous, chunk)) <= summary_input_budget
+    async def summarize(previous, chunk, limit_bytes):
+        assert estimate_tokens(build_summary_messages(previous, chunk, limit_bytes=limit_bytes)) <= summary_input_budget
         chunk.encode("utf-8").decode("utf-8")
         chunks.append(chunk)
         return '事实🙂\\"\n' * 250
@@ -257,7 +281,7 @@ async def test_repeated_compaction_only_summarizes_newly_archived_messages():
     wire = long_history()
     requests = []
 
-    async def summarize(previous, chunk):
+    async def summarize(previous, chunk, limit_bytes):
         requests.append((previous, chunk))
         return "All earlier work summarized."
 
@@ -278,12 +302,14 @@ async def test_repeated_compaction_only_summarizes_newly_archived_messages():
 
 async def test_final_serialized_request_is_checked_before_committing_summary():
     wire = long_history()
-    wire[2] = user("x" * 60000)
+    # The retained turns fit beside a plain placeholder summary of the maximum
+    # size, but JSON escaping doubles a backslash summary's serialized size.
+    wire[2] = user("x" * 54000)
     state = {}
     original = copy.deepcopy((wire, state))
 
-    async def summarize(previous, chunk):
-        return "\\" * SUMMARY_MAX_BYTES
+    async def summarize(previous, chunk, limit_bytes):
+        return "\\" * limit_bytes
 
     with pytest.raises(ValueError, match="still exceed the context budget"):
         await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
