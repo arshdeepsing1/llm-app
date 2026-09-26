@@ -551,14 +551,17 @@ it to `<chat workspace>/.agents/skills/handoff/SKILL.md` (for example
 `Local_Code/.agents/skills/handoff/SKILL.md`), reopen **Agent tools → Extensions**, and
 send `/skill handoff Create a handoff for this conversation`. It asks for a cold-start
 document in the style of a long working-session memory file, written in parts of
-about 20 KB so no single response hits the output limit, and ends by calling
-`insert_activity_log`. Select **Accept edits** first to avoid approving every part.
+about half the file text one response can hold (about 20 KB at 20,000 Max output
+tokens, about 8 KB at the 8,192 default) so no single response hits the output limit,
+and ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
 The skill uses 5.4 KB of the 8 KB skill budget. Automatic compaction handoffs (see
 Context and project instructions) are written from the turns being compacted; use the
 skill when you want a curated handoff, for example before ending a session.
 
 The model receives the current local date, time, and timezone with each request, so
-handoffs and file names use the real date. Its instructions keep chat replies concise
+handoffs and file names use the real date. It is also told its per-response output
+limit from **Max output tokens** and the approximate file text that fits (about 2 KB
+per 1,000 tokens), so long files are split into parts that finish in one response. Its instructions keep chat replies concise
 but ask for complete requested documents, split into parts rather than shortened.
 
 `insert_activity_log` inserts an exact, app-generated Markdown log of the

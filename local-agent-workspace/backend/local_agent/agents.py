@@ -159,6 +159,15 @@ def current_time_text(now=None):
             "Use it for dates; do not infer today's date from file names.")
 
 
+def output_limit_text(max_output_tokens):
+    """Lets the model size long file writes to the configured response limit."""
+    # Measured file-writing responses averaged about 2.2 bytes per output token;
+    # 2 bytes per token leaves room for JSON escaping and chat text.
+    return (f"Each of your responses can contain at most {max_output_tokens:,} output tokens, roughly "
+            f"{max_output_tokens * 2 // 1000:,} KB of file text in tool arguments; a longer response is cut off "
+            "and its tool calls do not run.")
+
+
 def model_history(wire):
     """Keep the archive and context offsets intact while excluding broken calls."""
     messages, omitted = [], {}
@@ -837,6 +846,7 @@ class AgentManager:
                   + "\nWorkspace: " + session["workspace"]
                   + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
                   + "\n" + current_time_text()
+                  + "\n" + output_limit_text(self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS))
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")}
         return system, guidance

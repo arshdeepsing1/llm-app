@@ -9,7 +9,7 @@ import pytest
 from local_agent.activity import (
     ACTIVITY_MARKER, activity_content, activity_log, insert_log, redact_secrets,
 )
-from local_agent.agents import AgentManager, current_time_text
+from local_agent.agents import AgentManager, current_time_text, output_limit_text
 from local_agent.config import Settings
 from local_agent.permissions import tool_decision
 from local_agent.store import Store
@@ -224,8 +224,15 @@ async def test_declined_or_plan_mode_insert_leaves_the_file_unchanged(runtime, m
     assert not manager.checkpoints.list(session["id"])
 
 
+def test_output_limit_text_states_tokens_and_approximate_file_size():
+    assert output_limit_text(20000).startswith(
+        "Each of your responses can contain at most 20,000 output tokens, roughly 40 KB of file text")
+    assert "at most 8,192 output tokens, roughly 16 KB" in output_limit_text(8192)
+
+
 async def test_system_prompt_states_the_date_and_that_documents_need_not_be_short(runtime, monkeypatch):
     manager, session, _ = runtime
+    manager.settings.values["max_output_tokens"] = 20000
     requests = []
 
     async def gateway(request):
@@ -239,6 +246,8 @@ async def test_system_prompt_states_the_date_and_that_documents_need_not_be_shor
     assert "Keep chat replies concise" in system
     assert "conciseness\napplies to chat replies, not to those files" in system
     assert "instead of shortening their" in system
+    assert "at most 20,000 output tokens, roughly 40 KB of file text" in system
+    assert requests[0]["max_tokens"] == 20000
     assert "insert_activity_log" in [tool["function"]["name"] for tool in requests[0]["tools"]]
 
 
@@ -254,5 +263,7 @@ def test_shipped_handoff_skill_loads_within_limits_and_uses_the_activity_log(run
     session["active_skills"] = ["handoff"]
     assert len(manager.skill_text(session, tools).encode()) <= 8000
     assert ACTIVITY_MARKER in skill["text"] and "insert_activity_log" in skill["text"]
+    # Part size follows the output limit stated in the system prompt, not a fixed size.
+    assert "half the file text the system prompt says one response can hold" in skill["text"]
     assert skill["text"].rstrip().endswith("Reply briefly with the path, the approximate size, and anything you could "
                                            "not recover (for example compacted turns).")
