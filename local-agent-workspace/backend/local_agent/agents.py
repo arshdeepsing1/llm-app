@@ -12,7 +12,8 @@ from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .permissions import BASIC_COMMANDS, COMMAND_TOOLS, mode_prompt, tool_decision
 from .context import (
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, SUMMARY_MAX_TOKENS,
-    build_summary_messages, prepare_context,
+    build_condense_messages, build_summary_messages, estimate_scale, estimate_tokens,
+    prepare_context, summary_byte_limit,
 )
 from .config import DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
@@ -809,19 +810,19 @@ class AgentManager:
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")}
         return system, guidance
 
-    async def summarize_context(self, session, client, url, headers, previous, chunk, preservation_note=""):
+    async def summarize_context(self, session, client, url, headers, messages):
         await self.status(session, "compacting")
+        estimated_input_tokens = estimate_tokens(messages)
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
             call = begin_inference_call(
                 session, "compaction", session["model"], max_output_tokens=SUMMARY_MAX_TOKENS,
-                attempt=attempt + 1)
+                attempt=attempt + 1, estimated_input_tokens=estimated_input_tokens)
             # Persist the attempt before provider admission so an abrupt process
             # exit cannot erase a request that Databricks may already have billed.
             self.store.save(session)
             try:
                 response = await client.post(url, headers=headers, json={
-                    "messages": build_summary_messages(previous, chunk, preservation_note),
-                    "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
+                    "messages": messages, "stream": False, "max_tokens": SUMMARY_MAX_TOKENS,
                 })
                 info = {"status": "running", "http_status": response.status_code}
                 try:
@@ -878,6 +879,31 @@ class AgentManager:
                     self.store.save(session)
                 raise
 
+    def compaction_requests(self, session, client, url, headers, preservation_note=""):
+        """Summary and condense callbacks for prepare_context, sharing one client."""
+        async def summarize(previous, chunk, limit_bytes):
+            return await self.summarize_context(session, client, url, headers, build_summary_messages(
+                previous, chunk, preservation_note, limit_bytes))
+
+        async def condense(summary, limit_bytes):
+            return await self.summarize_context(session, client, url, headers, build_condense_messages(
+                summary, limit_bytes, preservation_note))
+
+        return summarize, condense
+
+    async def summary_adjustment_notice(self, session, info):
+        adjustment = info.get("summary_adjustment")
+        if not adjustment:
+            return
+        limit = summary_byte_limit(info["input_budget"])
+        if adjustment == "condensed":
+            text = (f"The conversation summary was longer than {limit:,} bytes, so a short extra request "
+                    "condensed it. The full conversation history is preserved.")
+        else:
+            text = (f"The conversation summary was longer than {limit:,} bytes and could not be condensed, "
+                    "so part of it was omitted from the model's context. The full conversation history is preserved.")
+        await self.event(session, "notice", text=text)
+
     def start_compaction(self, session_id, preservation_note=""):
         if self.statuses.get(session_id, "idle") != "idle" or (session_id in self.tasks and not self.tasks[session_id].done()):
             raise ValueError("Stop the current response before compacting context.")
@@ -915,14 +941,13 @@ class AgentManager:
             url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
             headers = {"Authorization": f"Bearer {token}"}
             async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
-                async def summarize(previous, chunk):
-                    return await self.summarize_context(session, client, url, headers, previous, chunk, preservation_note)
-
+                summarize, condense = self.compaction_requests(session, client, url, headers, preservation_note)
                 _, updated, info = await prepare_context(
                     model_history(session["wire"]), state, system, definitions,
                     self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW), summarize,
                     reply_reserve=self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
-                    force_compact=True, preservation_note=preservation_note)
+                    force_compact=True, preservation_note=preservation_note, condense=condense,
+                    scale=estimate_scale(session.get("inference_calls"), session["model"]))
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True}
             prepared = {**session, "context_state": updated, "context_info": info}
@@ -930,6 +955,7 @@ class AgentManager:
             session.update(context_state=updated, context_info=info, updated=prepared["updated"])
             committed = True
             await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
+            await self.summary_adjustment_notice(session, info)
             await self.event(session, "notice", text="Context compacted. The full conversation history is preserved.")
         except asyncio.CancelledError:
             await self.event(session, "notice", text=("Context compaction completed. History is preserved." if committed
@@ -946,9 +972,12 @@ class AgentManager:
         attempt = 1 + sum(
             isinstance(item, dict) and item.get("event_id") == event["id"]
             for item in session.get("inference_calls", []))
+        messages = payload.get("messages")
         call = begin_inference_call(
             session, "agent", session["model"], event_id=event["id"],
-            max_output_tokens=payload.get("max_tokens"), attempt=attempt)
+            max_output_tokens=payload.get("max_tokens"), attempt=attempt,
+            estimated_input_tokens=(estimate_tokens(messages, payload.get("tools", ()))
+                                    if isinstance(messages, list) else None))
         # Record the attempt durably before sending it to the provider. Later
         # stream checkpoints replace this running state with the final outcome.
         self.store.save(session)
@@ -1106,9 +1135,7 @@ class AgentManager:
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
-            async def summarize(previous, chunk):
-                return await self.summarize_context(session, client, url, headers, previous, chunk)
-
+            summarize, condense = self.compaction_requests(session, client, url, headers)
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             consecutive_output_retries = 0
@@ -1116,12 +1143,14 @@ class AgentManager:
                 system, guidance = self.context_inputs(session, tools, mode)
                 messages, next_context, info = await prepare_context(
                     model_history(wire), context_state, system, definitions, context_window, summarize,
-                    reply_reserve=max_output_tokens)
+                    reply_reserve=max_output_tokens, condense=condense,
+                    scale=estimate_scale(session.get("inference_calls"), session["model"]))
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"]}
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
+                await self.summary_adjustment_notice(session, info)
                 await self.status(session, "running")
                 event = await self.event(session, "assistant", text="",
                                          request_info={"model": session["model"], "status": "running"})

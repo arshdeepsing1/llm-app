@@ -100,8 +100,13 @@ def _now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def begin_inference_call(session, purpose, model, *, event_id=None, max_output_tokens=None, attempt=None):
-    """Append one provider attempt to the durable per-session inference ledger."""
+def begin_inference_call(session, purpose, model, *, event_id=None, max_output_tokens=None, attempt=None,
+                         estimated_input_tokens=None):
+    """Append one provider attempt to the durable per-session inference ledger.
+
+    estimated_input_tokens is the app's unscaled heuristic estimate of the
+    request; comparing it with provider-reported usage calibrates later budgets.
+    """
     call = {"id": str(uuid.uuid4()), "purpose": purpose, "model": model,
             "created": _now(), "status": "running"}
     if event_id:
@@ -110,6 +115,8 @@ def begin_inference_call(session, purpose, model, *, event_id=None, max_output_t
         call["max_output_tokens"] = max_output_tokens
     if type(attempt) is int:
         call["attempt"] = attempt
+    if type(estimated_input_tokens) is int and estimated_input_tokens >= 0:
+        call["estimated_input_tokens"] = estimated_input_tokens
     session["inference_ledger_version"] = LEDGER_VERSION
     session.setdefault("inference_calls", []).append(call)
     return call

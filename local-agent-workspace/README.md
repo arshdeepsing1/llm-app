@@ -307,7 +307,7 @@ cannot be reconstructed. A delegated child's requests stay in its own conversati
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below remains a separate
-pre-request estimate even when reported usage is available.
+pre-request estimate, but reported input tokens calibrate it (see below).
 
 Every chat, title, and summary call is sent to
 `DBRICKS_URL/serving-endpoints/<selected endpoint>/invocations`; the app does not
@@ -347,6 +347,16 @@ three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
 overhead. This heuristic varies from the actual model tokenizer and is not a
 guaranteed upper bound, provider usage, or billing data. Older saved byte-based
 meters refresh on the next request.
+Each agent and summary request records this unscaled estimate in the usage ledger.
+When Databricks reports input tokens, later estimates for the same conversation and
+model are multiplied by the ratio of reported to estimated input tokens across up to
+the five most recent completed requests of at least 1,000 estimated tokens (cache
+read/write tokens are added to input tokens). The scale only raises the heuristic,
+never lowers it, and is capped at 2×. In one observed code-heavy chat, Claude
+reported about 26% more input tokens than the heuristic; a scale of about 1.26 makes
+automatic compaction start before the real request outgrows the context budget.
+Context details show the applied scale. A conversation's first request to a model,
+or older requests recorded before this calibration, use the unscaled heuristic.
 Expanded context details attribute that same estimate to system/project
 instructions (including selected skills), tool definitions, conversation messages
 and tool results, the retained summary, and request framing/rounding overhead.
@@ -381,8 +391,14 @@ When older turns no longer fit, the same endpoint summarizes them in bounded
 requests with at most 4,096 output tokens per summary request. Summary chunks use
 that independent reply reserve instead of the main response reserve, so increasing
 the main output setting does not multiply the number of compaction requests. The
-retained summary must also fit within 3,500 UTF-8 bytes; that byte cap is not a token count. These
-summary limits are separate from the main reply limit and total context budget.
+retained summary may use about an eighth of the input budget, between 3,500 and
+12,000 UTF-8 bytes (12,000 with the default settings); that byte cap is not a token
+count. A summary that comes back longer is not discarded, because producing it may
+have required a large billed request: a small extra request, containing only that
+summary, asks the model to condense it. If condensing fails or is still too long, the
+app keeps the start and end of the summary and omits part of the middle. Either case
+adds a visible notice and is shown in context details. These summary limits are
+separate from the main reply limit and total context budget.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain

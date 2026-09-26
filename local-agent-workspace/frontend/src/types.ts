@@ -53,6 +53,7 @@ export type ContextInfo = {
   instruction_sources?: { path: string; scope: string; status: 'loaded' | 'omitted'; estimated_tokens: number; reason?: string }[];
   prepared_for_next_turn?: boolean;
   breakdown?: { system_instructions: number; tool_definitions: number; messages_and_results: number; summary: number; request_overhead: number };
+  estimate_scale?: number; summary_adjustment?: 'condensed' | 'trimmed';
 }
 export type Session = {
   id: string; title: string; workspace: string; model: string;

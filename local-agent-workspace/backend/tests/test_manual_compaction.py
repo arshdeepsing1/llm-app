@@ -239,8 +239,8 @@ async def test_preservation_note_is_counted_in_each_bounded_summary_request():
             {"role": "user", "content": "Latest request"}]
     calls = []
 
-    async def summarize(previous, chunk):
-        request = build_summary_messages(previous, chunk, note)
+    async def summarize(previous, chunk, limit_bytes):
+        request = build_summary_messages(previous, chunk, note, limit_bytes)
         assert estimate_tokens(request) <= MIN_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - 2048
         calls.append(chunk)
         return "Earlier work preserved."

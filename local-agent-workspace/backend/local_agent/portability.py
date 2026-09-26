@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .context import MAX_ESTIMATE_SCALE, SUMMARY_MAX_BYTES
+
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
 MAX_SESSIONS = 32
@@ -92,7 +94,7 @@ class Message(Record):
 
 
 class ContextState(Record):
-    summary: str = Field(default="", max_length=3500)
+    summary: str = Field(default="", max_length=SUMMARY_MAX_BYTES)
     through: int = Field(default=0, ge=0)
     compactions: int = Field(default=0, ge=0)
 
@@ -126,6 +128,8 @@ class ContextInfo(Record):
     instruction_sources: list[InstructionSource] | None = None
     prepared_for_next_turn: bool | None = None
     breakdown: Breakdown | None = None
+    estimate_scale: float | None = Field(default=None, ge=1, le=MAX_ESTIMATE_SCALE)
+    summary_adjustment: Literal["condensed", "trimmed"] | None = None
 
 
 class Conversation(Record):
@@ -239,8 +243,8 @@ def validate_bundle(value):
             raise ValueError("Event IDs must be unique within each conversation.")
         state = session.get("context_state") or {}
         through = state.get("through", 0)
-        if len(state.get("summary", "").encode("utf-8")) > 3500:
-            raise ValueError("The conversation summary exceeds the 3,500-byte limit.")
+        if len(state.get("summary", "").encode("utf-8")) > SUMMARY_MAX_BYTES:
+            raise ValueError(f"The conversation summary exceeds the {SUMMARY_MAX_BYTES:,}-byte limit.")
         if through > len(session["wire"]) or through and through < len(session["wire"]) and session["wire"][through]["role"] != "user":
             raise ValueError("The saved summary must end at a complete turn boundary.")
         if through and not state.get("summary"):
