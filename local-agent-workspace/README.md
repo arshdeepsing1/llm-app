@@ -406,8 +406,12 @@ in that conversation's JSONL file. Summary requests are additional billed infere
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
 If the latest turn, tool output, or project guidance alone is too large, the app
-reports an error instead of silently cutting it. Increase the budget only within
-your endpoint's limit, or start a new conversation with a smaller request. There
+reports an error instead of silently cutting it. The error states the estimated
+tokens needed and the input-budget arithmetic (context budget minus Max output
+tokens minus the 2,048-token safety margin). When Max output tokens is above the
+8,192 default, it suggests lowering that first: for example, 131,000 context with
+121,000 reserved for output leaves only 7,952 input tokens. Otherwise, increase the
+budget only within your endpoint's limit, or start a new conversation with a smaller request. There
 is no model tokenizer integration. Retained job output is paginated; discarded
 process output cannot be recovered.
 

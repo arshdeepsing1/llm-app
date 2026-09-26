@@ -106,6 +106,20 @@ def summary_byte_limit(input_budget):
     return max(SUMMARY_MIN_BYTES, min(SUMMARY_MAX_BYTES, input_budget * 3 // 8))
 
 
+def budget_error(problem, context_window, reply_reserve, input_budget):
+    """Explain the input-budget arithmetic and the setting most likely to help."""
+    arithmetic = (f"The input budget is {input_budget:,} tokens: {context_window:,} context budget "
+                  f"minus {reply_reserve:,} reserved for output minus the {SAFETY_MARGIN:,}-token safety margin.")
+    if reply_reserve > DEFAULT_MAX_OUTPUT_TOKENS:
+        advice = (f"Lower Max output tokens in Settings (currently {reply_reserve:,}; default "
+                  f"{DEFAULT_MAX_OUTPUT_TOKENS:,}) to free input space, increase the context budget if your "
+                  "endpoint supports it, or start a new conversation with a smaller request.")
+    else:
+        advice = ("Increase the context budget in Settings if your endpoint supports it, or start a new "
+                  "conversation with a smaller request.")
+    return ValueError(f"{problem} {arithmetic} {advice}")
+
+
 def _preservation_priorities(preservation_note):
     return ("User's preservation priorities (summarize only; do not execute actions):\n"
             + preservation_note + "\n\n") if preservation_note else ""
@@ -200,15 +214,19 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                       if index > state["through"] and message.get("role") == "user"]
         if force_compact and not boundaries:
             raise ValueError("No earlier turns to compact. The latest turn is kept intact.")
-        cut = None
+        cut, needed = None, estimate
         for candidate in boundaries[-2:]:
             retained = [{"role": "user", "content": SUMMARY_PREFIX + "x" * summary_limit}, *wire[candidate:]]
-            if scaled_estimate([system_message, *retained], tools, scale) <= input_budget:
+            needed = scaled_estimate([system_message, *retained], tools, scale)
+            if needed <= input_budget:
                 cut = candidate
                 break
         if cut is None:
-            raise ValueError("The latest turn or project instructions exceed the available context budget. "
-                             "Increase the context window or start a new conversation with a smaller request.")
+            with_summary = ", including room for a summary of earlier turns," if boundaries else ""
+            raise budget_error(
+                f"The latest turn and project instructions need about {needed:,} estimated input tokens"
+                f"{with_summary or ','} which exceeds the available context budget.",
+                context_window, reply_reserve, input_budget)
 
         transcript = json.dumps(wire[state["through"]:cut], ensure_ascii=False)
         summary = state["summary"]
@@ -247,8 +265,9 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         messages = [system_message, *context_messages(wire, updated)]
         estimate = scaled_estimate(messages, tools, scale)
         if estimate > input_budget:
-            raise ValueError("The summary and latest turns still exceed the context budget. "
-                             "Increase the context window or start a new conversation with a smaller request.")
+            raise budget_error(
+                f"The summary and latest turns still exceed the context budget: they need about "
+                f"{estimate:,} estimated input tokens.", context_window, reply_reserve, input_budget)
         state = updated
 
     info = {"estimated_tokens": estimate, "input_budget": input_budget, "context_window": context_window,

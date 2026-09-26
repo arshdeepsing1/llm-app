@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import re
 
 import pytest
 
@@ -193,9 +194,32 @@ async def test_no_summary_call_when_latest_turn_or_system_cannot_fit(large_syste
     system = {"role": "system", "content": "s" * (90000 if large_system else 10)}
     state = {"summary": "", "through": 0, "compactions": 0}
     original = copy.deepcopy((wire, state))
-    with pytest.raises(ValueError, match="Increase the context window"):
+    with pytest.raises(ValueError, match="Increase the context budget in Settings"):
         await prepare_context(wire, state, system, TOOLS, COMPACTION_CONTEXT_WINDOW, forbidden_summary)
     assert (wire, state) == original
+
+
+async def test_large_output_reserve_error_shows_budget_arithmetic_and_lower_output_advice():
+    # A saved 131,000-token context with a 121,000-token output reserve leaves
+    # only 7,952 input tokens; raising the context by 72 tokens cannot fix that.
+    wire = [user("Read the memory files."), assistant("Reading."), user("Now the Airflow DAGs: " + "x" * 24000)]
+    with pytest.raises(ValueError) as error:
+        await prepare_context(wire, {}, SYSTEM, TOOLS, 131000, forbidden_summary, reply_reserve=121000)
+    message = str(error.value)
+    assert re.search(r"need about [\d,]+ estimated input tokens", message)
+    assert ("The input budget is 7,952 tokens: 131,000 context budget minus 121,000 reserved for output "
+            "minus the 2,048-token safety margin.") in message
+    assert "Lower Max output tokens in Settings (currently 121,000; default 8,192)" in message
+
+
+async def test_default_output_reserve_error_does_not_blame_the_output_setting():
+    wire = [user("old"), assistant("answer"), user("x" * 90000)]
+    with pytest.raises(ValueError) as error:
+        await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, forbidden_summary)
+    message = str(error.value)
+    assert "The input budget is 22,528 tokens: 32,768 context budget minus 8,192 reserved" in message
+    assert "Increase the context budget in Settings" in message
+    assert "Max output tokens" not in message
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("provider failed"), asyncio.CancelledError()])

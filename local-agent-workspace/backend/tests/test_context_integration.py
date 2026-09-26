@@ -133,6 +133,21 @@ async def test_oversize_current_turn_never_reaches_gateway(runtime, monkeypatch)
     assert session["wire"][-1]["content"] == "x" * 90000
 
 
+async def test_large_output_reserve_error_explains_budget_without_changing_settings(runtime, monkeypatch):
+    manager, session, _ = runtime
+    manager.settings.values.update(context_window=131000, max_output_tokens=121000)
+    settings = copy.deepcopy(manager.settings.values)
+    async def gateway(request):
+        pytest.fail("A request over the input budget must not be sent")
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Read the Airflow DAGs: " + "x" * 24000)
+    error = session["events"][-1]
+    assert error["type"] == "error"
+    assert "The input budget is 7,952 tokens: 131,000 context budget minus 121,000 reserved for output" in error["text"]
+    assert "Lower Max output tokens in Settings (currently 121,000; default 8,192)" in error["text"]
+    assert manager.settings.values == settings
+
+
 async def test_nested_write_defers_until_guidance_is_sent(runtime, monkeypatch):
     manager, session, project = runtime
     (project / "nested").mkdir()
