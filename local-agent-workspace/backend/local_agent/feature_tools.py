@@ -19,6 +19,8 @@ FEATURE_TOOLS = [
                {"task_id": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]},
                 "title": {"type": "string"}, "description": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}}}, ["task_id"]),
+    definition("insert_activity_log", "Insert an exact log of this conversation's commands (with results), file operations and other tool calls into a Markdown file, including turns no longer in your context. The app writes it, so it costs no output tokens: use it in handoffs instead of retyping commands. Replaces the line <!-- activity-log --> if the file has one, otherwise appends. Needs the same permission as write_file.",
+               {"path": {"type": "string"}}, ["path"]),
     definition("delegate_task", "Run one bounded subagent in a separate conversation using the same workspace and permissions. Pass needed context explicitly. Optional tool_profile narrows capabilities: read_only (file inspection), file_editor (inspection and file edits, no commands/MCP/hooks), inherit (parent's selected ceiling). Cannot widen the parent's subagent tool profile. Waits for the result; cannot recurse or leave background jobs.",
                {"task": {"type": "string"}, "context": {"type": "string"},
                 "tool_profile": {"type": "string", "enum": ["inherit", "read_only", "file_editor"]},

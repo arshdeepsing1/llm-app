@@ -2,7 +2,7 @@
 
 PROFILES = ("read_only", "file_editor", "inherit")
 READ_TOOLS = frozenset({"list_files", "read_file", "search_files", "list_skills", "use_skill", "list_tasks"})
-FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file"}
+FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file", "insert_activity_log"}
 
 
 def validate_profile(value):

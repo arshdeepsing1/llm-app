@@ -527,6 +527,36 @@ before a write, command, or MCP call. At most three selected skills fit a combin
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
 
+The app ships a detailed handoff skill at `skills/handoff/SKILL.md`. To use it, copy
+it to `<chat workspace>/.agents/skills/handoff/SKILL.md` (for example
+`Local_Code/.agents/skills/handoff/SKILL.md`), reopen **Agent tools → Extensions**, and
+send `/skill handoff Create a handoff for this conversation`. It asks for a cold-start
+document in the style of a long working-session memory file, written in parts of
+about 20 KB so no single response hits the output limit, and ends by calling
+`insert_activity_log`. Select **Accept edits** first to avoid approving every part.
+The skill uses 5.4 KB of the 8 KB skill budget. Write a handoff before the context
+meter nears its limit: once turns are compacted, the model sees only their summary.
+
+The model receives the current local date, time, and timezone with each request, so
+handoffs and file names use the real date. Its instructions keep chat replies concise
+but ask for complete requested documents, split into parts rather than shortened.
+
+`insert_activity_log` inserts an exact, app-generated Markdown log of the
+conversation's commands (with results and exit codes), files created, edited, read,
+listed, or searched, declined or failed actions, and other tool-call counts. The app
+builds it from the saved display history, so it covers compacted turns and costs no
+output tokens; the model receives only a short summary. It replaces the line
+`<!-- activity-log -->` when the file has exactly one, and otherwise appends. It runs
+as a `write_file` with generated content: the same permission modes, folder access,
+approval diff, file checkpoint, and `write_file` hooks apply (Plan mode blocks it).
+Commands are copied as they ran except that the app's configured credentials and
+common secret shapes (GitHub and Databricks tokens, AWS access keys, bearer tokens,
+`password=`/`token=`-style values, and URL passwords) are replaced with `[REDACTED]`;
+review the file before sharing it. The finished file must stay within 80 KB: the
+oldest commands are omitted with a note when needed, so insert the log into a
+separate file to keep every command. Delegated subagent conversations keep their own
+logs.
+
 Tool arguments are validated against their advertised JSON Schema before approvals,
 hooks, or execution, then pass the existing semantic/path checks. Validation is
 offline and bounded: only local acyclic JSON pointers are supported; remote/dynamic
@@ -730,6 +760,8 @@ bundle after starting the backend, restart the backend to register static assets
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
+- `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
+- `skills/handoff/SKILL.md`: detailed handoff skill to copy into a workspace's `.agents/skills/handoff/`.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
