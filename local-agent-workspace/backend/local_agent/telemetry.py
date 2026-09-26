@@ -1,5 +1,6 @@
 """Provider-reported inference telemetry and documented DBU estimates."""
 
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -23,6 +24,9 @@ MODEL_DBU_PER_MILLION = {
     },
 }
 PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title"}
+# Databricks AI Gateway stores these tags in system.ai_gateway.usage.request_tags,
+# so each ledger record can be joined to the provider's usage rows exactly.
+REQUEST_TAGS_HEADER = "Databricks-Ai-Gateway-Request-Tags"
 
 
 class InferenceError(ValueError):
@@ -120,6 +124,19 @@ def begin_inference_call(session, purpose, model, *, event_id=None, max_output_t
     session["inference_ledger_version"] = LEDGER_VERSION
     session.setdefault("inference_calls", []).append(call)
     return call
+
+
+def request_tag_headers(session, call):
+    """Request tags naming this ledger record, its conversation and purpose."""
+    tags = {"local_agent_call_id": call["id"], "local_agent_conversation": str(session.get("id", "")),
+            "local_agent_purpose": call["purpose"]}
+    return {REQUEST_TAGS_HEADER: json.dumps(tags, separators=(",", ":"))}
+
+
+def record_response_id(call, value):
+    """Keep the provider's response id (Databricks encrypts it) for support requests."""
+    if call is not None and "response_id" not in call and isinstance(value, str) and 0 < len(value) <= 500:
+        call["response_id"] = value
 
 
 def finish_inference_call(call, info):

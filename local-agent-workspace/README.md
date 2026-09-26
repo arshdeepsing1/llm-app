@@ -317,6 +317,42 @@ section for immediate per-conversation telemetry,
 [`system.ai_gateway.usage`](https://docs.databricks.com/aws/en/ai-gateway/usage-tracking)
 for workspace/account observability, and [`system.billing.usage`](https://docs.databricks.com/aws/en/ai-gateway/cost-observability)
 for billable usage. Those surfaces have different scopes and update timing.
+
+**Correlating usage with the conversation file.** Each Usage row is one
+`inference_call` record in `<state dir>/conversations/<conversation-id>.jsonl`.
+An agent call's `event_id` names the assistant reply it produced; the tool events
+that follow that reply are the tools it called; a retried request repeats the
+`event_id` with the next `attempt`. Title and compaction calls have no `event_id`.
+**Export CSV** in the Usage section downloads one row per call with local and UTC
+times, tokens, the DBU estimate, the reply excerpt, the tools it called, and the
+IDs below. The same rows are available offline with
+`python3 scripts/usage_report.py <conversation file>.jsonl [--csv usage.csv]`
+(Python 3 only; copy the file first if the app is running). Excerpts pass through
+the same credential redaction as other exports; cells that a spreadsheet would run
+as formulas are prefixed with `'`.
+
+Every request carries a `Databricks-Ai-Gateway-Request-Tags` header with
+`local_agent_call_id` (the ledger record id), `local_agent_conversation`, and
+`local_agent_purpose`. Databricks documents storing these tags in the
+`request_tags` column of `system.ai_gateway.usage`, so where your endpoint's usage
+is recorded there you can join exactly:
+
+```sql
+SELECT event_time, request_tags['local_agent_call_id'] AS call_id,
+       input_tokens, output_tokens, status_code
+FROM system.ai_gateway.usage
+WHERE request_tags['local_agent_conversation'] = '<conversation id>'
+ORDER BY event_time;
+```
+
+Whether a given `/serving-endpoints/.../invocations` endpoint is tracked in that
+table depends on its Databricks gateway configuration; the legacy
+`system.serving.endpoint_usage` table has no field this app sets (the Foundation
+Model API does not document `client_request_id` or `usage_context` for chat
+requests, so the app does not send them). Match there on endpoint, `request_time`
+within a few seconds of `started_utc`, and the exact token counts. The ledger also
+keeps each response's `id` as `response_id` (Databricks encrypts it) for support
+requests.
 For chat and context-summary calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response
 received before streaming begins is retried at most three times. The app honors numeric or HTTP-date `Retry-After`
 headers and root/nested JSON `retry_after` values, capped at 60 seconds; otherwise
@@ -786,6 +822,7 @@ bundle after starting the backend, restart the backend to register static assets
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `skills/handoff/SKILL.md`: detailed handoff skill to copy into a workspace's `.agents/skills/handoff/`.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
+- `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.

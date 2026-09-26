@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api } from '../api'
+import { api, apiText } from '../api'
 import type { InferenceCallMetric, Session, UsageMetrics, UsageTokenCounts } from '../types'
 
 type Props = { session: Session | null; onError: (message: string) => void }
@@ -85,10 +85,28 @@ export default function UsagePanel({ session, onError }: Props) {
     } finally { if (alive.current && request === latestRequest.current) setLoading(false) }
   }, [sessionId])
   useEffect(() => { setMetrics(null); void refresh() }, [refresh])
+  const [exporting, setExporting] = useState(false)
+  const exportCsv = async () => {
+    if (!sessionId) return
+    setExporting(true); setError('')
+    try {
+      const text = await apiText(`/sessions/${encodeURIComponent(sessionId)}/usage.csv`)
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `usage-${sessionId.slice(0, 8)}.csv`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (cause) {
+      if (alive.current) { const message = (cause as Error).message; setError(message); report.current(message) }
+    } finally { if (alive.current) setExporting(false) }
+  }
 
   if (!session) return <section className="agent-tools-section" aria-label="Usage"><h3>Usage and cost</h3><p>Start a conversation to track its model usage.</p></section>
   return <section className="agent-tools-section usage-panel" aria-label="Usage">
-    <div className="agent-tools-section-heading"><div><h3>Usage and cost</h3><p>Provider-reported model calls for this conversation.</p></div><button className="outline" disabled={loading} onClick={() => void refresh()}>{loading ? 'Refreshing…' : 'Refresh usage'}</button></div>
+    <div className="agent-tools-section-heading"><div><h3>Usage and cost</h3><p>Provider-reported model calls for this conversation. Export CSV adds the reply and tools behind each call and the IDs sent to Databricks as request tags.</p></div><div className="agent-tools-actions"><button className="outline" disabled={exporting} onClick={() => void exportCsv()}>{exporting ? 'Exporting…' : 'Export CSV'}</button><button className="outline" disabled={loading} onClick={() => void refresh()}>{loading ? 'Refreshing…' : 'Refresh usage'}</button></div></div>
     {error ? <p className="form-error" role="alert">{error}</p> : null}
     {!metrics && loading ? <p role="status">Loading usage…</p> : null}
     {metrics ? <>

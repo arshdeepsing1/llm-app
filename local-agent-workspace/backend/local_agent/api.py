@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -21,6 +21,8 @@ from .store import Store
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
 from .telemetry import session_metrics
+from .activity import redact_secrets
+from .usage_export import usage_csv, usage_rows
 from .feature_api import register_features
 from .portability_api import register_portability
 
@@ -264,6 +266,14 @@ def create_app(settings=None):
     @app.get("/api/sessions/{session_id}/metrics")
     async def get_session_metrics(session_id: str):
         return session_metrics(session_or_404(session_id))
+
+    @app.get("/api/sessions/{session_id}/usage.csv")
+    async def export_session_usage(session_id: str):
+        session = session_or_404(session_id)
+        text = usage_csv(usage_rows(session, redact=lambda value: settings.redact(redact_secrets(value))))
+        return Response(text, media_type="text/csv; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="usage-{session_id[:8]}.csv"',
+            "Cache-Control": "no-store"})
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str):

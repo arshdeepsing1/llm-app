@@ -174,6 +174,36 @@ it('shows a separate per-conversation usage graph and estimated DBU cost', async
   expect(fetchMock.mock.calls.filter(([path]) => path === '/api/sessions/a/metrics')).toHaveLength(requests)
 })
 
+it('exports usage as a CSV download with the local token', async () => {
+  const csv = 'n,purpose\n1,agent\n'
+  const created: Blob[] = []
+  const createObjectURL = vi.fn((blob: Blob) => { created.push(blob); return 'blob:usage' })
+  const revokeObjectURL = vi.fn()
+  const original = { createObjectURL: URL.createObjectURL, revokeObjectURL: URL.revokeObjectURL }
+  Object.assign(URL, { createObjectURL, revokeObjectURL })  // jsdom does not implement these
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+    expect(this.download).toBe('usage-a.csv')
+    expect(this.href).toBe('blob:usage')
+  })
+  override = path => path === '/api/sessions/a/usage.csv' ? Promise.resolve(new Response(csv, { status: 200, headers: { 'Content-Type': 'text/csv' } })) : undefined
+  await openTab('Usage')
+  fireEvent.click(await screen.findByRole('button', { name: 'Export CSV' }))
+  await waitFor(() => expect(click).toHaveBeenCalledTimes(1))
+  const request = fetchMock.mock.calls.find(([path]) => path === '/api/sessions/a/usage.csv')
+  expect(Object.keys(request![1]!.headers as Record<string, string>)).toContain('X-Local-Token')
+  expect(await created[0].text()).toBe(csv)
+  expect(revokeObjectURL).toHaveBeenCalledWith('blob:usage')
+  click.mockRestore()
+  Object.assign(URL, original)
+})
+
+it('shows an export failure instead of downloading', async () => {
+  override = path => path === '/api/sessions/a/usage.csv' ? Promise.resolve(json({ detail: 'Conversation not found.' }, 404)) : undefined
+  await openTab('Usage')
+  fireEvent.click(await screen.findByRole('button', { name: 'Export CSV' }))
+  expect(await screen.findByText('Conversation not found.')).toBeTruthy()
+})
+
 it('renders missing provider usage as unavailable rather than zero', async () => {
   override = path => path === '/api/sessions/a/metrics' ? Promise.resolve(json({
     ...metrics,

@@ -32,7 +32,7 @@ from .reasoning import reasoning_summary
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
-    reported_usage, stream_error_kind,
+    record_response_id, reported_usage, request_tag_headers, stream_error_kind,
 )
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
@@ -868,7 +868,7 @@ class AgentManager:
             # exit cannot erase a request that Databricks may already have billed.
             self.store.save(session)
             try:
-                response = await client.post(url, headers=headers, json={
+                response = await client.post(url, headers={**headers, **request_tag_headers(session, call)}, json={
                     "messages": messages, "stream": False, "max_tokens": max_tokens,
                 }, **({"timeout": timeout} if timeout else {}))
                 info = {"status": "running", "http_status": response.status_code}
@@ -879,6 +879,7 @@ class AgentManager:
                 usage = reported_usage(payload.get("usage")) if isinstance(payload, dict) else {}
                 if usage:
                     info["usage"] = usage
+                record_response_id(call, payload.get("id") if isinstance(payload, dict) else None)
                 diagnostic = self.settings.redact(response.text)[:1000]
                 if response.status_code != 200:
                     info.update(status="error", error_kind=http_error_kind(response.status_code))
@@ -1099,7 +1100,8 @@ class AgentManager:
         draft = StreamDraft(self.store, session)
         tool_buffer, finish = ToolCallBuffer(), None
         try:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
+            async with client.stream("POST", url, headers={**headers, **request_tag_headers(session, call)},
+                                     json=payload) as response:
                 info["http_status"] = response.status_code
                 draft.changed()
                 if response.status_code != 200:
@@ -1127,6 +1129,7 @@ class AgentManager:
                     chunk = json.loads(data)
                     if not isinstance(chunk, dict):
                         raise InferenceError("The model returned an invalid streaming response.", "invalid_response")
+                    record_response_id(call, chunk.get("id"))
                     usage = reported_usage(chunk.get("usage"))
                     if usage:
                         # Streaming counts are cumulative snapshots, never additive deltas.
